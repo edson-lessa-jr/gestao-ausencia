@@ -60,7 +60,7 @@ O Worker serve a aplicação React e a API no mesmo domínio.
 ## Segurança
 
 - Não existem senhas padrão no repositório.
-- Senhas são derivadas com PBKDF2-SHA-256 e salt individual (210 mil iterações).
+- Senhas são derivadas com PBKDF2-SHA-256 e salt individual (100 mil iterações).
 - Sessões usam tokens aleatórios, armazenados no banco apenas como SHA-256.
 - Cookies são `HttpOnly`, `Secure` e `SameSite=Lax`.
 - Operações administrativas são validadas novamente no backend.

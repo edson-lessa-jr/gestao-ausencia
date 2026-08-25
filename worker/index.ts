@@ -26,7 +26,7 @@ async function sha256(value: string) {
 async function passwordHash(password: string, salt: string) {
   const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: encoder.encode(salt), iterations: 210_000 }, key, 256,
+    { name: 'PBKDF2', hash: 'SHA-256', salt: encoder.encode(salt), iterations: 100_000 }, key, 256,
   )
   return bytesToHex(new Uint8Array(bits))
 }
@@ -265,5 +265,10 @@ app.get('/api/dashboard', async (c) => {
 })
 
 app.notFound((c) => c.json(jsonError('Recurso não encontrado.', 404), 404))
+
+app.onError((error, c) => {
+  console.error('Unhandled application error', error)
+  return c.json(jsonError('Erro interno ao processar a operação.', 500), 500)
+})
 
 export default app
