@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "gestao-ausencia",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "fe29e40f-031e-4808-8016-db3a924304b5",
       "migrations_dir": "migrations"
     }
   ]
