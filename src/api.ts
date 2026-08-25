@@ -11,6 +11,7 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const post = <T>(path: string, body?: unknown) => api<T>(path, { method: 'POST', body: JSON.stringify(body) })
 export const patch = <T>(path: string, body?: unknown) => api<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
+export const remove = <T>(path: string) => api<T>(path, { method: 'DELETE' })
 
 export function formatDate(value: string) {
   return new Intl.DateTimeFormat('pt-BR', { timeZone: 'UTC' }).format(new Date(`${value}T12:00:00Z`))

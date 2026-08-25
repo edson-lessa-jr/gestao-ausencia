@@ -7,10 +7,14 @@ Aplicação para controle e projeção de férias e demais ausências, com auten
 - Autenticação com PBKDF2 e sessão em cookie `HttpOnly`.
 - Perfis Administrador, Supervisor e Colaborador.
 - Solicitação e aprovação de ausências.
+- Toda solicitação nasce pendente; somente supervisores confirmam ou rejeitam e o solicitante pode cancelar.
 - Inclusão de solicitação pelo supervisor para integrantes da equipe.
+- Edição e inativação de colaboradores por administradores e supervisores.
 - Regras individuais de acréscimo mensal e fator de desconto de férias.
 - Projeção mensal do saldo, incluindo férias solicitadas e confirmadas.
 - Feriados globais ou por equipe no cálculo de dias úteis.
+- Importação de feriados por CSV (`data;nome;equipe`), além de edição e exclusão.
+- Calendário anual em matriz com os saldos e ausências de todos os integrantes da equipe, de janeiro a dezembro.
 - Limites anuais de 4 dias não justificados e 15 dias justificados.
 - Licenças paternidade (30 dias corridos) e maternidade (150 dias corridos).
 - Registro de auditoria das principais operações.

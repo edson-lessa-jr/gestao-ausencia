@@ -1,13 +1,39 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Alert, Box, Paper, Stack, Typography } from '@mui/material'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  Alert, Box, Chip, FormControl, InputLabel, MenuItem, Paper, Select, Stack, Table, TableBody,
+  TableCell, TableContainer, TableHead, TableRow, Typography,
+} from '@mui/material'
 import { api, formatDate } from '../api'
-import type { AbsenceRequest, User } from '../types'
-import { absenceLabels } from '../types'
-import StatusChip from '../components/StatusChip'
+import type { AbsenceType, RequestStatus, User } from '../types'
+import { absenceLabels, statusLabels } from '../types'
 
-export default function CalendarPage({ user: _user }: { user: User }) {
-  const [rows, setRows] = useState<AbsenceRequest[]>([]); const [error, setError] = useState('')
-  useEffect(() => { void api<{ requests: AbsenceRequest[] }>('/requests').then((r) => setRows(r.requests)).catch((e: Error) => setError(e.message)) }, [])
-  const grouped = useMemo(() => rows.filter((r) => ['REQUESTED', 'CONFIRMED'].includes(r.status)).sort((a, b) => a.start_date.localeCompare(b.start_date)).reduce<Record<string, AbsenceRequest[]>>((acc, row) => { const key = new Intl.DateTimeFormat('pt-BR', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(`${row.start_date}T12:00:00Z`)); (acc[key] ||= []).push(row); return acc }, {}), [rows])
-  return <><Box mb={3}><Typography variant="h4">Calendário</Typography><Typography color="text.secondary">Linha do tempo das ausências solicitadas e confirmadas.</Typography></Box>{error && <Alert severity="error">{error}</Alert>}<Stack spacing={2}>{Object.entries(grouped).map(([month, requests]) => <Paper variant="outlined" key={month} sx={{ overflow: 'hidden' }}><Box sx={{ px: 2.5, py: 1.5, bgcolor: '#f1f8fb', borderBottom: '1px solid', borderColor: 'divider' }}><Typography fontWeight={750} sx={{ textTransform: 'capitalize' }}>{month}</Typography></Box>{requests.map((row) => <Box key={row.id} sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '180px 1fr auto' }, gap: 2, px: 2.5, py: 2, alignItems: 'center', borderBottom: '1px solid', borderColor: 'divider', '&:last-child': { borderBottom: 0 } }}><Typography variant="body2" color="text.secondary">{formatDate(row.start_date)} — {formatDate(row.end_date)}</Typography><Box><Typography fontWeight={700}>{row.user_name}</Typography><Typography variant="caption" color="text.secondary">{absenceLabels[row.type]} · {row.business_days} dias úteis</Typography></Box><StatusChip status={row.status} /></Box>)}</Paper>)}{!Object.keys(grouped).length && <Paper variant="outlined" sx={{ p: 8, textAlign: 'center', color: 'text.secondary' }}>Nenhuma ausência planejada.</Paper>}</Stack></>
+interface Team { id: string; name: string }
+interface CalendarAbsence { id: string; type: AbsenceType; start_date: string; end_date: string; status: RequestStatus; business_days: number; calendar_days: number }
+interface CalendarMonth { month: number; confirmedBalance: number; projectedBalance: number; absences: CalendarAbsence[] }
+interface CalendarMember { user: User; months: CalendarMonth[] }
+const months = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez']
+
+export default function CalendarPage({ user }: { user: User }) {
+  const [year, setYear] = useState(new Date().getFullYear()); const [teamId, setTeamId] = useState('')
+  const [teams, setTeams] = useState<Team[]>([]); const [calendar, setCalendar] = useState<CalendarMember[]>([]); const [error, setError] = useState('')
+  const load = useCallback(async () => {
+    try {
+      const query = new URLSearchParams({ year: String(year) }); if (teamId) query.set('teamId', teamId)
+      const result = await api<{ calendar: CalendarMember[] }>(`/calendar?${query}`); setCalendar(result.calendar)
+    } catch (e) { setError(e instanceof Error ? e.message : 'Erro ao carregar o calendário.') }
+  }, [teamId, year])
+  useEffect(() => { if (user.role === 'ADMIN') void api<{ teams: Team[] }>('/teams').then((result) => setTeams(result.teams)) }, [user.role])
+  useEffect(() => { void load() }, [load])
+  return <>
+    <Stack direction={{ xs: 'column', sm: 'row' }} justifyContent="space-between" alignItems={{ sm: 'center' }} spacing={2} mb={3}>
+      <Box><Typography variant="h4">Calendário anual</Typography><Typography color="text.secondary">Saldos mensais e todas as ausências solicitadas ou confirmadas da equipe.</Typography></Box>
+      <Stack direction="row" spacing={1.5}><FormControl size="small" sx={{ minWidth: 120 }}><InputLabel>Ano</InputLabel><Select label="Ano" value={year} onChange={(e) => setYear(Number(e.target.value))}>{Array.from({ length: 7 }, (_, index) => new Date().getFullYear() - 3 + index).map((value) => <MenuItem key={value} value={value}>{value}</MenuItem>)}</Select></FormControl>{user.role === 'ADMIN' && <FormControl size="small" sx={{ minWidth: 190 }}><InputLabel>Equipe</InputLabel><Select label="Equipe" value={teamId} onChange={(e) => setTeamId(e.target.value)}><MenuItem value="">Todas as equipes</MenuItem>{teams.map((team) => <MenuItem key={team.id} value={team.id}>{team.name}</MenuItem>)}</Select></FormControl>}</Stack>
+    </Stack>
+    <Alert severity="info" sx={{ mb: 2 }}>O saldo principal inclui solicitações e confirmações. Quando houver diferença, o saldo considerando somente ausências confirmadas aparece abaixo.</Alert>
+    {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+    <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 'calc(100vh - 245px)' }}><Table stickyHeader size="small" sx={{ minWidth: 2200 }}>
+      <TableHead><TableRow><TableCell sx={{ position: 'sticky', left: 0, zIndex: 4, minWidth: 220 }}>Colaborador</TableCell>{months.map((month) => <TableCell key={month} align="center" sx={{ minWidth: 160 }}>{month}</TableCell>)}</TableRow></TableHead>
+      <TableBody>{calendar.map((member) => <TableRow key={member.user.id} sx={{ verticalAlign: 'top' }}><TableCell sx={{ position: 'sticky', left: 0, zIndex: 2, bgcolor: 'background.paper', borderRight: '1px solid', borderColor: 'divider' }}><Typography fontWeight={750}>{member.user.name}</Typography><Typography variant="caption" color="text.secondary">{member.user.team_name}</Typography>{!member.user.active && <Chip size="small" label="Inativo" sx={{ mt: 1 }} />}</TableCell>{member.months.map((month) => <TableCell key={month.month} sx={{ p: 1.25 }}><Typography fontWeight={800} color="primary.main">{month.projectedBalance.toLocaleString('pt-BR')} d</Typography>{month.projectedBalance !== month.confirmedBalance && <Typography variant="caption" color="text.secondary">Confirmado: {month.confirmedBalance.toLocaleString('pt-BR')} d</Typography>}<Stack spacing={.75} mt={1}>{month.absences.map((absence) => <Box key={absence.id} sx={{ borderLeft: '3px solid', borderColor: absence.status === 'CONFIRMED' ? 'success.main' : 'warning.main', pl: .75 }}><Typography variant="caption" fontWeight={700} display="block">{absenceLabels[absence.type]}</Typography><Typography variant="caption" color="text.secondary" display="block">{formatDate(absence.start_date).slice(0, 5)}–{formatDate(absence.end_date).slice(0, 5)}</Typography><Typography variant="caption" color={absence.status === 'CONFIRMED' ? 'success.main' : 'warning.main'}>{statusLabels[absence.status]}</Typography></Box>)}</Stack></TableCell>)}</TableRow>)}{!calendar.length && <TableRow><TableCell colSpan={13} align="center" sx={{ py: 8, color: 'text.secondary' }}>Nenhum colaborador encontrado.</TableCell></TableRow>}</TableBody>
+    </Table></TableContainer>
+  </>
 }

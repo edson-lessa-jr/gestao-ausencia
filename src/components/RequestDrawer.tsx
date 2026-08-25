@@ -9,9 +9,9 @@ import { absenceLabels } from '../types'
 
 export default function RequestDrawer({ open, onClose, user, onSaved }: { open: boolean; onClose: () => void; user: User; onSaved: () => void }) {
   const [users, setUsers] = useState<User[]>([])
-  const [form, setForm] = useState({ user_id: user.id, type: 'VACATION' as AbsenceType, start_date: '', end_date: '', reason: '', status: 'REQUESTED' })
+  const [form, setForm] = useState({ user_id: user.id, type: 'VACATION' as AbsenceType, start_date: '', end_date: '', reason: '' })
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
-  useEffect(() => { if (open && user.role !== 'EMPLOYEE') void api<{ users: User[] }>('/users').then((r) => { setUsers(r.users); if (r.users.length) setForm((f) => ({ ...f, user_id: f.user_id === user.id ? r.users[0].id : f.user_id })) }) }, [open, user.id, user.role])
+  useEffect(() => { if (open && user.role !== 'EMPLOYEE') void api<{ users: User[] }>('/users').then((r) => { const available = r.users.filter((member) => member.active && (user.role !== 'SUPERVISOR' || member.team_id === user.team_id)); setUsers(available); if (available.length) setForm((f) => ({ ...f, user_id: f.user_id === user.id ? available[0].id : f.user_id })) }) }, [open, user.id, user.role, user.team_id])
   const selected = useMemo(() => users.find((u) => u.id === form.user_id) || user, [users, user, form.user_id])
   const estimated = useMemo(() => {
     if (!form.start_date || !form.end_date || form.end_date < form.start_date) return null
@@ -33,7 +33,7 @@ export default function RequestDrawer({ open, onClose, user, onSaved }: { open: 
         {user.role !== 'EMPLOYEE' && <FormControl fullWidth><InputLabel>Colaborador</InputLabel><Select label="Colaborador" value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })}>{users.map((u) => <MenuItem key={u.id} value={u.id}>{u.name} · {u.team_name}</MenuItem>)}</Select></FormControl>}
         <FormControl fullWidth><InputLabel>Tipo de ausência</InputLabel><Select label="Tipo de ausência" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as AbsenceType })}>{Object.entries(absenceLabels).map(([value, label]) => <MenuItem key={value} value={value}>{label}</MenuItem>)}</Select></FormControl>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField fullWidth label="Data de início" type="date" slotProps={{ inputLabel: { shrink: true } }} value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} /><TextField fullWidth label="Data de término" type="date" slotProps={{ inputLabel: { shrink: true } }} value={form.end_date} onChange={(e) => setForm({ ...form, end_date: e.target.value })} /></Stack>
-        {user.role !== 'EMPLOYEE' && <FormControl fullWidth><InputLabel>Status inicial</InputLabel><Select label="Status inicial" value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}><MenuItem value="REQUESTED">Solicitada</MenuItem><MenuItem value="CONFIRMED">Confirmada</MenuItem></Select></FormControl>}
+        <Alert severity="warning">Toda nova ausência será registrada como solicitada e aguardará decisão do supervisor.</Alert>
         <TextField label="Observação" multiline minRows={3} value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} />
         {estimated && <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
           <Box sx={{ p: 2 }}><Typography variant="body2" color="text.secondary">Período calculado</Typography><Typography fontWeight={750}>{form.type === 'PATERNITY' || form.type === 'MATERNITY' ? `${estimated.calendar} dias corridos` : `${estimated.business} dias úteis`}</Typography></Box>
