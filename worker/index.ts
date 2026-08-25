@@ -2,6 +2,8 @@ import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { addDays, calendarDays, countBusinessDays, isoDate, vacationBalance } from './domain'
 
+// Deployed through Cloudflare Workers Builds from the main branch.
+
 type Bindings = { DB: D1Database; ASSETS: Fetcher }
 type Role = 'ADMIN' | 'SUPERVISOR' | 'EMPLOYEE'
 type User = {
