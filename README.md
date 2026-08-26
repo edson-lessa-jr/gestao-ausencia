@@ -6,14 +6,17 @@ Aplicação para controle e projeção de férias e demais ausências, com auten
 
 - Autenticação com PBKDF2 e sessão em cookie `HttpOnly`.
 - Perfis Administrador, Supervisor e Colaborador.
-- Solicitação e aprovação de ausências.
-- Toda solicitação nasce pendente; somente supervisores confirmam ou rejeitam e o solicitante pode cancelar.
+- Fluxo de ausências com solicitação, aprovação interna, registro no Quantum e aprovação no Quantum.
+- Toda solicitação nasce pendente; somente supervisores aprovam e o solicitante pode cancelar até a aprovação final no Quantum.
 - Inclusão de solicitação pelo supervisor para integrantes da equipe.
 - Edição e inativação de colaboradores por administradores e supervisores.
 - Regras individuais de acréscimo mensal e fator de desconto de férias.
 - Projeção mensal do saldo, incluindo férias solicitadas e confirmadas.
-- Feriados globais ou por equipe no cálculo de dias úteis.
-- Importação de feriados por CSV (`data;nome;equipe`), além de edição e exclusão.
+- Feriados globais ou por equipe, integrais ou de meio período, no cálculo de dias úteis.
+- Importação de feriados por CSV (`data;nome;equipe;duracao;saldo_administrativo`), além de edição e exclusão.
+- Saldo administrativo separado, com créditos automáticos por ausência e créditos eventuais por trabalho em feriado.
+- Comunicado semanal editável, preservado após a publicação e pronto para copiar no Teams.
+- Notificações por e-mail ao solicitante e envio do comunicado aos supervisores.
 - Calendário anual em matriz com os saldos e ausências de todos os integrantes da equipe, de janeiro a dezembro.
 - Limites anuais de 4 dias não justificados e 15 dias justificados.
 - Licenças paternidade (30 dias corridos) e maternidade (150 dias corridos).
@@ -25,8 +28,8 @@ Aplicação para controle e projeção de férias e demais ausências, com auten
 2. O crédito mensal ocorre a cada mudança de mês após a data-base.
 3. O crédito continua sendo acumulado durante qualquer ausência.
 4. Férias descontam `dias úteis × fator de desconto` do colaborador.
-5. O saldo atual considera férias confirmadas já concluídas; a projeção também considera solicitações pendentes.
-6. Fins de semana e feriados cadastrados são excluídos dos dias úteis.
+5. O saldo oficial considera férias aprovadas no Quantum já concluídas; a projeção também considera os status anteriores.
+6. Fins de semana e feriados cadastrados são excluídos total ou parcialmente dos dias úteis.
 7. Limites anuais são reiniciados em 1º de janeiro.
 
 ## Desenvolvimento local
@@ -60,6 +63,23 @@ O Vite abre em `http://localhost:5173` e encaminha `/api` ao Worker em `http://l
 5. No primeiro acesso, a aplicação abrirá a criação do administrador inicial.
 
 O Worker serve a aplicação React e a API no mesmo domínio.
+
+Após atualizar uma instalação existente, aplique obrigatoriamente a migração `0002_workflow_communications.sql` antes de usar o novo Worker:
+
+```bash
+npm run db:migrate:remote
+```
+
+## Envio de e-mail
+
+O Worker usa a API do Resend. Configure os segredos no Cloudflare Worker:
+
+```bash
+npx wrangler secret put RESEND_API_KEY
+npx wrangler secret put EMAIL_FROM
+```
+
+`EMAIL_FROM` deve ser um remetente autorizado no Resend, por exemplo `Gestão de ausências <ausencias@seudominio.br>`. Sem essas configurações, a operação continua funcionando e a tentativa fica registrada como `SKIPPED` no banco para auditoria.
 
 ## Segurança
 

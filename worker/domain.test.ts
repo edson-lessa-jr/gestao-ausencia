@@ -1,18 +1,24 @@
 import { describe, expect, it } from 'vitest'
-import { calendarDays, countBusinessDays, monthsBetween, vacationBalance } from './domain'
+import { calendarDays, countBusinessDays, monthsBetween, vacationBalance, weekRange } from './domain'
 
 describe('regras de contagem', () => {
   it('conta dias corridos de forma inclusiva', () => expect(calendarDays('2026-08-01', '2026-08-30')).toBe(30))
   it('desconsidera fins de semana e feriados nos dias úteis', () => {
     expect(countBusinessDays('2026-08-24', '2026-08-28', new Set(['2026-08-25']))).toBe(4)
   })
+  it('considera feriado de meio período como meio dia útil', () => {
+    expect(countBusinessDays('2026-08-24', '2026-08-28', new Map([['2026-08-25', 0.5]]))).toBe(4.5)
+  })
   it('conta mudanças de mês desde a data-base', () => expect(monthsBetween('2026-01-15', '2026-08-25')).toBe(7))
+  it('determina a semana atual e a próxima de segunda a domingo', () => {
+    expect(weekRange('2026-08-26')).toEqual({ currentStart: '2026-08-24', currentEnd: '2026-08-30', nextStart: '2026-08-31', nextEnd: '2026-09-06' })
+  })
 })
 
 describe('projeção de férias', () => {
   const user = { balance_start_date: '2026-01-15', opening_vacation_balance: 10, monthly_accrual: 2.5 }
   const requests = [
-    { end_date: '2026-04-10', debit_days: 5, status: 'CONFIRMED' },
+    { end_date: '2026-04-10', debit_days: 5, status: 'QUANTUM_APPROVED' },
     { end_date: '2026-09-10', debit_days: 4, status: 'REQUESTED' },
   ]
   it('mantém o acúmulo mensal e desconta apenas férias confirmadas no saldo atual', () => {

@@ -1,10 +1,10 @@
 import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
-import { addDays, calendarDays, countBusinessDays, isoDate, vacationBalance } from './domain'
+import { addDays, calendarDays, countBusinessDays, isoDate, vacationBalance, weekRange } from './domain'
 
 // Deployed through Cloudflare Workers Builds from the main branch.
 
-type Bindings = { DB: D1Database; ASSETS: Fetcher }
+type Bindings = { DB: D1Database; ASSETS: Fetcher; RESEND_API_KEY?: string; EMAIL_FROM?: string }
 type Role = 'ADMIN' | 'SUPERVISOR' | 'EMPLOYEE'
 type User = {
   id: string; name: string; email: string; role: Role; team_id: string | null; team_name?: string | null
@@ -35,9 +35,115 @@ async function passwordHash(password: string, salt: string) {
 
 async function businessDays(db: D1Database, start: string, end: string, teamId: string | null) {
   const holidayRows = await db.prepare(
-    `SELECT date FROM holidays WHERE date BETWEEN ? AND ? AND (team_id IS NULL OR team_id = ?)`
-  ).bind(start, end, teamId).all<{ date: string }>()
-  return countBusinessDays(start, end, new Set(holidayRows.results.map((row) => row.date)))
+    `SELECT date, MAX(duration) duration FROM holidays WHERE date BETWEEN ? AND ? AND (team_id IS NULL OR team_id = ?) GROUP BY date`
+  ).bind(start, end, teamId).all<{ date: string; duration: number }>()
+  return countBusinessDays(start, end, new Map(holidayRows.results.map((row) => [row.date, Number(row.duration)])))
+}
+
+const statusLabels: Record<string, string> = {
+  REQUESTED: 'Solicitada', APPROVED: 'Aprovada', QUANTUM_REGISTERED: 'Registrada no Quantum',
+  QUANTUM_APPROVED: 'Aprovada no Quantum', REJECTED: 'Rejeitada', CANCELLED: 'Cancelada',
+}
+const absenceLabels: Record<string, string> = {
+  VACATION: 'Férias', JUSTIFIED: 'Ausência justificada', UNJUSTIFIED: 'Ausência não justificada',
+  PATERNITY: 'Licença-paternidade', MATERNITY: 'Licença-maternidade', ADMINISTRATIVE: 'Folga administrativa',
+}
+const formatDateBr = (value: string) => value.split('-').reverse().join('/')
+
+async function sendEmail(
+  db: D1Database,
+  env: Bindings,
+  input: { recipient: string; subject: string; body: string; requestId?: string; communicationId?: string },
+) {
+  const id = crypto.randomUUID()
+  await db.prepare(`INSERT INTO email_notifications
+    (id, request_id, communication_id, recipient, subject, body) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(id, input.requestId || null, input.communicationId || null, input.recipient, input.subject, input.body).run()
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) {
+    await db.prepare(`UPDATE email_notifications SET status = 'SKIPPED', error = ? WHERE id = ?`)
+      .bind('RESEND_API_KEY ou EMAIL_FROM não configurado.', id).run()
+    return { id, status: 'SKIPPED' as const }
+  }
+  try {
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: env.EMAIL_FROM, to: [input.recipient], subject: input.subject, text: input.body }),
+    })
+    const result = await response.json<{ id?: string; message?: string }>()
+    if (!response.ok) throw new Error(result.message || `Falha HTTP ${response.status}`)
+    await db.prepare(`UPDATE email_notifications SET status = 'SENT', attempts = 1, provider_id = ?, sent_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .bind(result.id || null, id).run()
+    return { id, status: 'SENT' as const }
+  } catch (error) {
+    await db.prepare(`UPDATE email_notifications SET status = 'FAILED', attempts = 1, error = ? WHERE id = ?`)
+      .bind(error instanceof Error ? error.message : 'Falha desconhecida.', id).run()
+    return { id, status: 'FAILED' as const }
+  }
+}
+
+async function notifyRequestStatus(db: D1Database, env: Bindings, requestId: string, actorName: string, note?: string) {
+  const request = await db.prepare(`SELECT r.*, u.name user_name, u.email FROM absence_requests r
+    JOIN users u ON u.id = r.user_id WHERE r.id = ?`).bind(requestId).first<{
+      id: string; type: string; start_date: string; end_date: string; status: string; user_name: string; email: string
+    }>()
+  if (!request) return { status: 'SKIPPED' as const }
+  const body = `Olá, ${request.user_name}.\n\nSua solicitação de ${absenceLabels[request.type]}, referente ao período de ${formatDateBr(request.start_date)} a ${formatDateBr(request.end_date)}, foi atualizada.\n\nNovo status: ${statusLabels[request.status]}\nAtualizado por: ${actorName}\nData da atualização: ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}${note ? `\n\nObservação:\n${note}` : ''}`
+  return sendEmail(db, env, { recipient: request.email, subject: 'Atualização da sua solicitação de ausência', body, requestId })
+}
+
+async function applyFinalBalanceEntries(db: D1Database, requestId: string, actorId: string) {
+  const request = await db.prepare(`SELECT r.*, u.team_id FROM absence_requests r JOIN users u ON u.id = r.user_id WHERE r.id = ?`)
+    .bind(requestId).first<{ id: string; user_id: string; team_id: string | null; type: string; start_date: string; end_date: string; administrative_days: number }>()
+  if (!request) return
+  const holidays = await db.prepare(`SELECT * FROM holidays WHERE date BETWEEN ? AND ? AND generates_admin_credit = 1
+    AND (team_id IS NULL OR team_id = ?) ORDER BY date, duration DESC`)
+    .bind(request.start_date, request.end_date, request.team_id).all<{ id: string; date: string; duration: number }>()
+  const holidayByDate = new Map<string, { id: string; duration: number }>()
+  for (const holiday of holidays.results) if (!holidayByDate.has(holiday.date)) holidayByDate.set(holiday.date, holiday)
+  const statements: D1PreparedStatement[] = []
+  for (const holiday of holidayByDate.values()) {
+    statements.push(db.prepare(`INSERT OR IGNORE INTO administrative_balance_entries
+      (id, user_id, holiday_id, request_id, amount, entry_type, note, created_by)
+      VALUES (?, ?, ?, ?, ?, 'AUTOMATIC_ABSENCE', ?, ?)`)
+      .bind(crypto.randomUUID(), request.user_id, holiday.id, request.id, Number(holiday.duration), 'Crédito automático por ausência em feriado.', actorId))
+  }
+  if (request.type === 'ADMINISTRATIVE' && Number(request.administrative_days) > 0) {
+    statements.push(db.prepare(`INSERT OR IGNORE INTO administrative_balance_entries
+      (id, user_id, request_id, amount, entry_type, note, created_by)
+      VALUES (?, ?, ?, ?, 'USAGE', ?, ?)`)
+      .bind(crypto.randomUUID(), request.user_id, request.id, -Number(request.administrative_days), 'Utilização de saldo administrativo.', actorId))
+  }
+  if (statements.length) await db.batch(statements)
+}
+
+type WeeklyRequest = {
+  id: string; user_name: string; type: string; start_date: string; end_date: string;
+  business_days: number; calendar_days: number; administrative_days: number; status: string
+}
+
+function weeklyRequestBlock(request: WeeklyRequest, includeStatus = false) {
+  const duration = ['PATERNITY', 'MATERNITY'].includes(request.type)
+    ? `${request.calendar_days} dias corridos`
+    : request.type === 'ADMINISTRATIVE'
+      ? `${request.administrative_days.toLocaleString('pt-BR')} dia(s)`
+      : `${request.business_days.toLocaleString('pt-BR')} dias úteis`
+  return `• ${request.user_name}\n  Ausência: ${absenceLabels[request.type]}\n  Período: ${formatDateBr(request.start_date)} a ${formatDateBr(request.end_date)}\n  Duração: ${duration}${includeStatus ? `\n  Status: ${statusLabels[request.status]}` : ''}`
+}
+
+function buildWeeklyBody(reference: string, requests: WeeklyRequest[]) {
+  const range = weekRange(reference)
+  const approved = requests.filter((request) => request.status === 'QUANTUM_APPROVED')
+  const current = approved.filter((request) => request.start_date <= range.currentEnd && request.end_date >= range.currentStart)
+  const next = approved.filter((request) => request.start_date <= range.nextEnd && request.end_date >= range.nextStart)
+  const pending = requests.filter((request) => request.status !== 'QUANTUM_APPROVED')
+  const section = (items: WeeklyRequest[], empty: string) => items.length ? items.map((item) => weeklyRequestBlock(item)).join('\n\n') : empty
+  const pendingSection = pending.length ? pending.map((item) => weeklyRequestBlock(item, true)).join('\n\n') : 'Não há solicitações pendentes para o período.'
+  const generatedAt = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
+  return {
+    ...range,
+    body: `COMUNICADO SEMANAL DE AUSÊNCIAS\n\nPeríodo considerado: ${formatDateBr(range.currentStart)} a ${formatDateBr(range.nextEnd)}\n\nSEMANA ATUAL — ${formatDateBr(range.currentStart)} a ${formatDateBr(range.currentEnd)}\n\n${section(current, 'Não há ausências com aprovação concluída no Quantum para esta semana.')}\n\nPRÓXIMA SEMANA — ${formatDateBr(range.nextStart)} a ${formatDateBr(range.nextEnd)}\n\n${section(next, 'Não há ausências com aprovação concluída no Quantum para esta semana.')}\n\nSOLICITAÇÕES PENDENTES\n\n${pendingSection}\n\nMensagem gerada em ${generatedAt}.`,
+  }
 }
 
 async function audit(db: D1Database, actorId: string | null, action: string, entityType: string, entityId?: string, payload?: unknown) {
@@ -132,24 +238,27 @@ app.post('/api/teams', async (c) => {
 
 app.get('/api/users', async (c) => {
   const actor = c.get('user')
-  const condition = actor.role === 'EMPLOYEE' ? 'WHERE u.id = ?' : ''
+  const condition = actor.role === 'EMPLOYEE' ? 'WHERE u.id = ?' : actor.role === 'SUPERVISOR' ? 'WHERE u.team_id = ?' : ''
   const query = c.env.DB.prepare(`SELECT u.id, u.name, u.email, u.role, u.team_id, t.name team_name, u.active,
     u.hire_date, u.balance_start_date, u.opening_vacation_balance, u.monthly_accrual, u.vacation_debit_factor
     FROM users u LEFT JOIN teams t ON t.id = u.team_id ${condition} ORDER BY u.name`)
-  const rows = actor.role === 'EMPLOYEE' ? await query.bind(actor.id).all<User>() : await query.all<User>()
+  const rows = actor.role === 'ADMIN' ? await query.all<User>() : await query.bind(actor.role === 'EMPLOYEE' ? actor.id : actor.team_id).all<User>()
   return c.json({ users: rows.results })
 })
 
 app.post('/api/users', async (c) => {
   const actor = c.get('user')
-  if (actor.role !== 'ADMIN') return c.json(jsonError('Acesso restrito.', 403), 403)
+  if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
   const body = await c.req.json<Partial<User> & { password: string }>()
-  if (!body.name || !body.email || !body.password || !body.team_id || !body.role) return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
+  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id
+  const role = actor.role === 'SUPERVISOR' ? 'EMPLOYEE' : body.role
+  if (!body.name || !body.email || !body.password || !teamId || !role) return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
+  if (body.password.length < 10) return c.json(jsonError('A senha temporária deve ter pelo menos 10 caracteres.'), 400)
   const id = crypto.randomUUID(); const salt = crypto.randomUUID()
   await c.env.DB.prepare(`INSERT INTO users
     (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date, opening_vacation_balance, monthly_accrual, vacation_debit_factor)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, body.name.trim(), body.email.trim().toLowerCase(), await passwordHash(body.password, salt), salt, body.role, body.team_id,
+    .bind(id, body.name.trim(), body.email.trim().toLowerCase(), await passwordHash(body.password, salt), salt, role, teamId,
       body.hire_date || today(), body.balance_start_date || today(), Number(body.opening_vacation_balance || 0), Number(body.monthly_accrual || 2.5), Number(body.vacation_debit_factor || 1)).run()
   await audit(c.env.DB, actor.id, 'CREATE', 'USER', id, { ...body, password: undefined })
   return c.json({ id }, 201)
@@ -160,10 +269,14 @@ app.patch('/api/users/:id', async (c) => {
   if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
   const target = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(c.req.param('id')).first<User>()
   if (!target) return c.json(jsonError('Colaborador não encontrado.', 404), 404)
+  if (actor.role === 'SUPERVISOR' && (target.team_id !== actor.team_id || target.role === 'ADMIN')) {
+    return c.json(jsonError('O supervisor somente pode alterar colaboradores da própria equipe.', 403), 403)
+  }
   const body = await c.req.json<Partial<User> & { password?: string }>()
   if (body.role && !['ADMIN', 'SUPERVISOR', 'EMPLOYEE'].includes(body.role)) return c.json(jsonError('Perfil inválido.'), 400)
   const role = actor.role === 'ADMIN' && body.role ? body.role : target.role
-  if (!body.name || !body.email || !body.team_id || !body.hire_date || !body.balance_start_date) {
+  const teamId = actor.role === 'SUPERVISOR' ? target.team_id : body.team_id
+  if (!body.name || !body.email || !teamId || !body.hire_date || !body.balance_start_date) {
     return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
   }
   if (target.id === actor.id && !body.active) return c.json(jsonError('Você não pode inativar a própria conta.'), 409)
@@ -175,7 +288,7 @@ app.patch('/api/users/:id', async (c) => {
   const statements = [c.env.DB.prepare(`UPDATE users SET name = ?, email = ?, role = ?, team_id = ?, active = ?,
     hire_date = ?, balance_start_date = ?, opening_vacation_balance = ?, monthly_accrual = ?, vacation_debit_factor = ?,
     updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(
-      body.name.trim(), body.email.trim().toLowerCase(), role, body.team_id, body.active ? 1 : 0,
+      body.name.trim(), body.email.trim().toLowerCase(), role, teamId, body.active ? 1 : 0,
       body.hire_date, body.balance_start_date, Number(body.opening_vacation_balance ?? 0),
       Number(body.monthly_accrual ?? 2.5), Number(body.vacation_debit_factor ?? 1), target.id,
     )]
@@ -199,10 +312,14 @@ app.get('/api/holidays', async (c) => {
 app.post('/api/holidays', async (c) => {
   const actor = c.get('user')
   if (actor.role === 'EMPLOYEE') return c.json(jsonError('Acesso restrito.', 403), 403)
-  const body = await c.req.json<{ date: string; name: string; team_id?: string | null }>()
+  const body = await c.req.json<{ date: string; name: string; team_id?: string | null; duration?: number; generates_admin_credit?: boolean }>()
+  const duration = Number(body.duration ?? 1)
+  if (![0.5, 1].includes(duration)) return c.json(jsonError('A duração deve ser de meio período ou dia inteiro.'), 400)
   const id = crypto.randomUUID()
   const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id || null
-  await c.env.DB.prepare('INSERT INTO holidays (id, date, name, team_id) VALUES (?, ?, ?, ?)').bind(id, body.date, body.name.trim(), teamId).run()
+  await c.env.DB.prepare(`INSERT INTO holidays (id, date, name, team_id, duration, generates_admin_credit)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(id, body.date, body.name.trim(), teamId, duration, body.generates_admin_credit === false ? 0 : 1).run()
   await audit(c.env.DB, actor.id, 'CREATE', 'HOLIDAY', id, body)
   return c.json({ id }, 201)
 })
@@ -212,10 +329,12 @@ app.patch('/api/holidays/:id', async (c) => {
   if (actor.role === 'EMPLOYEE') return c.json(jsonError('Acesso restrito.', 403), 403)
   const current = await c.env.DB.prepare('SELECT * FROM holidays WHERE id = ?').bind(c.req.param('id')).first<{ id: string; team_id: string | null }>()
   if (!current || (actor.role === 'SUPERVISOR' && current.team_id !== actor.team_id)) return c.json(jsonError('Feriado não encontrado.', 404), 404)
-  const body = await c.req.json<{ date: string; name: string; team_id?: string | null }>()
+  const body = await c.req.json<{ date: string; name: string; team_id?: string | null; duration?: number; generates_admin_credit?: boolean }>()
+  const duration = Number(body.duration ?? 1)
+  if (![0.5, 1].includes(duration)) return c.json(jsonError('A duração deve ser de meio período ou dia inteiro.'), 400)
   const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id || null
-  await c.env.DB.prepare('UPDATE holidays SET date = ?, name = ?, team_id = ? WHERE id = ?')
-    .bind(body.date, body.name.trim(), teamId, current.id).run()
+  await c.env.DB.prepare(`UPDATE holidays SET date = ?, name = ?, team_id = ?, duration = ?, generates_admin_credit = ? WHERE id = ?`)
+    .bind(body.date, body.name.trim(), teamId, duration, body.generates_admin_credit === false ? 0 : 1, current.id).run()
   await audit(c.env.DB, actor.id, 'UPDATE', 'HOLIDAY', current.id, body)
   return c.json({ ok: true })
 })
@@ -233,17 +352,20 @@ app.delete('/api/holidays/:id', async (c) => {
 app.post('/api/holidays/import', async (c) => {
   const actor = c.get('user')
   if (actor.role === 'EMPLOYEE') return c.json(jsonError('Acesso restrito.', 403), 403)
-  const body = await c.req.json<{ holidays: Array<{ date: string; name: string; team_id?: string | null }> }>()
+  const body = await c.req.json<{ holidays: Array<{ date: string; name: string; team_id?: string | null; duration?: number; generates_admin_credit?: boolean }> }>()
   if (!Array.isArray(body.holidays) || body.holidays.length === 0 || body.holidays.length > 400) {
     return c.json(jsonError('Envie entre 1 e 400 feriados.'), 400)
   }
   const statements: D1PreparedStatement[] = []
   for (const item of body.holidays) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(item.date) || !item.name?.trim()) return c.json(jsonError('O CSV contém data ou descrição inválida.'), 400)
+    const duration = Number(item.duration ?? 1)
+    if (![0.5, 1].includes(duration)) return c.json(jsonError('O CSV contém uma duração diferente de 0,5 ou 1.'), 400)
     const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : item.team_id || null
     if (teamId === null) statements.push(c.env.DB.prepare('DELETE FROM holidays WHERE date = ? AND team_id IS NULL').bind(item.date))
-    statements.push(c.env.DB.prepare('INSERT OR REPLACE INTO holidays (id, date, name, team_id) VALUES (?, ?, ?, ?)')
-      .bind(crypto.randomUUID(), item.date, item.name.trim(), teamId))
+    statements.push(c.env.DB.prepare(`INSERT OR REPLACE INTO holidays
+      (id, date, name, team_id, duration, generates_admin_credit) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(crypto.randomUUID(), item.date, item.name.trim(), teamId, duration, item.generates_admin_credit === false ? 0 : 1))
   }
   await c.env.DB.batch(statements)
   await audit(c.env.DB, actor.id, 'IMPORT', 'HOLIDAY', undefined, { count: body.holidays.length })
@@ -262,7 +384,10 @@ app.get('/api/requests', async (c) => {
 
 app.post('/api/requests', async (c) => {
   const actor = c.get('user')
-  const body = await c.req.json<{ user_id?: string; type: string; start_date: string; end_date: string; reason?: string }>()
+  const body = await c.req.json<{ user_id?: string; type: string; start_date: string; end_date: string; reason?: string; administrative_days?: number }>()
+  if (!['VACATION', 'JUSTIFIED', 'UNJUSTIFIED', 'PATERNITY', 'MATERNITY', 'ADMINISTRATIVE'].includes(body.type)) {
+    return c.json(jsonError('Tipo de ausência inválido.'), 400)
+  }
   const userId = actor.role === 'EMPLOYEE' ? actor.id : body.user_id || actor.id
   const target = await c.env.DB.prepare('SELECT * FROM users WHERE id = ? AND active = 1').bind(userId).first<User>()
   if (!target) return c.json(jsonError('Colaborador não encontrado.', 404), 404)
@@ -276,37 +401,208 @@ app.post('/api/requests', async (c) => {
   if (['JUSTIFIED', 'UNJUSTIFIED'].includes(body.type)) {
     const year = body.start_date.slice(0, 4)
     const used = await c.env.DB.prepare(`SELECT COALESCE(SUM(business_days), 0) total FROM absence_requests
-      WHERE user_id = ? AND type = ? AND status IN ('REQUESTED', 'CONFIRMED') AND substr(start_date, 1, 4) = ?`)
+      WHERE user_id = ? AND type = ? AND status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED', 'QUANTUM_APPROVED') AND substr(start_date, 1, 4) = ?`)
       .bind(userId, body.type, year).first<{ total: number }>()
     if (Number(used?.total ?? 0) + bizDays > limits[body.type]) return c.json(jsonError(`Saldo anual insuficiente. Limite: ${limits[body.type]} dias úteis.`), 400)
+  }
+  const administrativeDays = body.type === 'ADMINISTRATIVE' ? Number(body.administrative_days ?? bizDays) : 0
+  if (body.type === 'ADMINISTRATIVE') {
+    if (administrativeDays <= 0 || administrativeDays > bizDays || !Number.isInteger(administrativeDays * 2)) {
+      return c.json(jsonError('A utilização administrativa deve respeitar incrementos de meio dia e o período informado.'), 400)
+    }
+    const ledger = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) balance FROM administrative_balance_entries WHERE user_id = ?`)
+      .bind(userId).first<{ balance: number }>()
+    const reserved = await c.env.DB.prepare(`SELECT COALESCE(SUM(administrative_days), 0) total FROM absence_requests
+      WHERE user_id = ? AND type = 'ADMINISTRATIVE' AND status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED')`)
+      .bind(userId).first<{ total: number }>()
+    if (administrativeDays > Number(ledger?.balance ?? 0) - Number(reserved?.total ?? 0)) {
+      return c.json(jsonError('Saldo administrativo insuficiente para esta solicitação.'), 409)
+    }
   }
   const debit = body.type === 'VACATION' ? bizDays * Number(target.vacation_debit_factor) : 0
   const id = crypto.randomUUID()
   await c.env.DB.prepare(`INSERT INTO absence_requests
-    (id, user_id, created_by, type, start_date, end_date, business_days, calendar_days, debit_days, status, reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, userId, actor.id, body.type, body.start_date, body.end_date, bizDays, calDays, debit, 'REQUESTED', body.reason || null).run()
+    (id, user_id, created_by, type, start_date, end_date, business_days, calendar_days, debit_days, administrative_days, status, reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'REQUESTED', ?)`)
+    .bind(id, userId, actor.id, body.type, body.start_date, body.end_date, bizDays, calDays, debit, administrativeDays, body.reason || null).run()
+  await c.env.DB.prepare(`INSERT INTO request_status_history (id, request_id, actor_id, previous_status, new_status, note)
+    VALUES (?, ?, ?, NULL, 'REQUESTED', ?)`)
+    .bind(crypto.randomUUID(), id, actor.id, body.reason || null).run()
   await audit(c.env.DB, actor.id, 'CREATE', 'ABSENCE_REQUEST', id, body)
-  return c.json({ id, business_days: bizDays, calendar_days: calDays, debit_days: debit }, 201)
+  const email = await notifyRequestStatus(c.env.DB, c.env, id, actor.name, body.reason)
+  return c.json({ id, business_days: bizDays, calendar_days: calDays, debit_days: debit, administrative_days: administrativeDays, email_status: email.status }, 201)
 })
 
 app.patch('/api/requests/:id/status', async (c) => {
   const actor = c.get('user')
   const body = await c.req.json<{ status: string; note?: string }>()
-  if (!['CONFIRMED', 'REJECTED', 'CANCELLED'].includes(body.status)) return c.json(jsonError('Status inválido.'), 400)
+  if (!['APPROVED', 'QUANTUM_REGISTERED', 'QUANTUM_APPROVED', 'REJECTED', 'CANCELLED'].includes(body.status)) {
+    return c.json(jsonError('Status inválido.'), 400)
+  }
   const request = await c.env.DB.prepare(`SELECT r.*, u.team_id FROM absence_requests r JOIN users u ON u.id = r.user_id WHERE r.id = ?`)
     .bind(c.req.param('id')).first<{ team_id: string; user_id: string; status: string }>()
   if (!request) return c.json(jsonError('Solicitação não encontrada.', 404), 404)
-  if (request.status !== 'REQUESTED') return c.json(jsonError('Somente solicitações pendentes podem ser alteradas.'), 409)
+  const isTeamSupervisor = actor.role === 'SUPERVISOR' && request.team_id === actor.team_id
   if (body.status === 'CANCELLED') {
-    if (request.user_id !== actor.id) return c.json(jsonError('Somente o solicitante pode cancelar esta solicitação.', 403), 403)
-  } else if (actor.role !== 'SUPERVISOR' || request.team_id !== actor.team_id) {
-    return c.json(jsonError('Somente o supervisor da equipe pode aprovar ou rejeitar.', 403), 403)
+    if (!['REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED'].includes(request.status)) return c.json(jsonError('Esta solicitação não pode mais ser cancelada.'), 409)
+    if (request.user_id !== actor.id && !isTeamSupervisor) return c.json(jsonError('Somente o solicitante ou o supervisor da equipe pode cancelar.'), 403)
+    if (!body.note?.trim()) return c.json(jsonError('Informe a justificativa do cancelamento.'), 400)
+  } else if (body.status === 'APPROVED' || body.status === 'REJECTED') {
+    if (request.status !== 'REQUESTED') return c.json(jsonError('Somente solicitações em análise podem ser aprovadas ou rejeitadas.'), 409)
+    if (!isTeamSupervisor) return c.json(jsonError('Somente o supervisor da equipe pode aprovar ou rejeitar.'), 403)
+  } else if (body.status === 'QUANTUM_REGISTERED') {
+    if (request.status !== 'APPROVED') return c.json(jsonError('A solicitação precisa estar aprovada pelo supervisor.'), 409)
+    if (request.user_id !== actor.id && !isTeamSupervisor) return c.json(jsonError('Somente o solicitante ou o supervisor pode registrar no Quantum.'), 403)
+  } else if (body.status === 'QUANTUM_APPROVED') {
+    if (request.status !== 'QUANTUM_REGISTERED') return c.json(jsonError('A solicitação precisa estar registrada no Quantum.'), 409)
+    if (!isTeamSupervisor) return c.json(jsonError('Somente o supervisor da equipe pode confirmar a aprovação no Quantum.'), 403)
   }
-  await c.env.DB.prepare('UPDATE absence_requests SET status = ?, supervisor_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-    .bind(body.status, body.note || null, c.req.param('id')).run()
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE absence_requests SET status = ?, supervisor_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .bind(body.status, body.note || null, c.req.param('id')),
+    c.env.DB.prepare(`INSERT INTO request_status_history
+      (id, request_id, actor_id, previous_status, new_status, note) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(crypto.randomUUID(), c.req.param('id'), actor.id, request.status, body.status, body.note || null),
+  ])
+  if (body.status === 'QUANTUM_APPROVED') await applyFinalBalanceEntries(c.env.DB, c.req.param('id'), actor.id)
   await audit(c.env.DB, actor.id, 'STATUS_CHANGE', 'ABSENCE_REQUEST', c.req.param('id'), body)
-  return c.json({ ok: true })
+  const email = await notifyRequestStatus(c.env.DB, c.env, c.req.param('id'), actor.name, body.note)
+  return c.json({ ok: true, email_status: email.status })
+})
+
+app.get('/api/requests/:id/history', async (c) => {
+  const actor = c.get('user')
+  const request = await c.env.DB.prepare(`SELECT r.user_id, u.team_id FROM absence_requests r JOIN users u ON u.id = r.user_id WHERE r.id = ?`)
+    .bind(c.req.param('id')).first<{ user_id: string; team_id: string | null }>()
+  if (!request) return c.json(jsonError('Solicitação não encontrada.', 404), 404)
+  if (actor.role === 'EMPLOYEE' && request.user_id !== actor.id) return c.json(jsonError('Acesso restrito.', 403), 403)
+  if (actor.role === 'SUPERVISOR' && request.team_id !== actor.team_id) return c.json(jsonError('Acesso restrito.', 403), 403)
+  const history = await c.env.DB.prepare(`SELECT h.*, u.name actor_name FROM request_status_history h
+    LEFT JOIN users u ON u.id = h.actor_id WHERE h.request_id = ? ORDER BY h.created_at`)
+    .bind(c.req.param('id')).all()
+  return c.json({ history: history.results })
+})
+
+app.get('/api/administrative-balances', async (c) => {
+  const actor = c.get('user')
+  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : c.req.query('teamId') || null
+  const userId = actor.role === 'EMPLOYEE' ? actor.id : c.req.query('userId') || null
+  let where = 'WHERE 1=1'; const binds: Array<string> = []
+  if (userId) { where += ' AND u.id = ?'; binds.push(userId) }
+  if (teamId) { where += ' AND u.team_id = ?'; binds.push(teamId) }
+  const balancesQuery = c.env.DB.prepare(`SELECT u.id user_id, u.name user_name, u.team_id, t.name team_name,
+    COALESCE((SELECT SUM(e.amount) FROM administrative_balance_entries e WHERE e.user_id = u.id), 0) balance,
+    COALESCE((SELECT SUM(r.administrative_days) FROM absence_requests r WHERE r.user_id = u.id AND r.type = 'ADMINISTRATIVE'
+      AND r.status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED')), 0) reserved
+    FROM users u LEFT JOIN teams t ON t.id = u.team_id ${where} ORDER BY t.name, u.name`)
+  const balances = binds.length ? await balancesQuery.bind(...binds).all() : await balancesQuery.all()
+  const allowedIds = balances.results.map((row) => String((row as { user_id: string }).user_id))
+  let entries: unknown[] = []
+  if (allowedIds.length) {
+    const placeholders = allowedIds.map(() => '?').join(',')
+    const result = await c.env.DB.prepare(`SELECT e.*, u.name user_name, h.name holiday_name, h.date holiday_date,
+      creator.name created_by_name FROM administrative_balance_entries e JOIN users u ON u.id = e.user_id
+      LEFT JOIN holidays h ON h.id = e.holiday_id LEFT JOIN users creator ON creator.id = e.created_by
+      WHERE e.user_id IN (${placeholders}) ORDER BY e.created_at DESC LIMIT 300`).bind(...allowedIds).all()
+    entries = result.results
+  }
+  return c.json({ balances: balances.results, entries })
+})
+
+app.post('/api/administrative-balances/credits', async (c) => {
+  const actor = c.get('user')
+  if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
+  const body = await c.req.json<{ user_id: string; holiday_id: string; amount: number; note: string }>()
+  const target = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(body.user_id).first<User>()
+  if (!target || (actor.role === 'SUPERVISOR' && target.team_id !== actor.team_id)) return c.json(jsonError('Colaborador não encontrado na equipe.'), 404)
+  const holiday = await c.env.DB.prepare('SELECT * FROM holidays WHERE id = ?').bind(body.holiday_id)
+    .first<{ id: string; team_id: string | null; duration: number }>()
+  if (!holiday || (holiday.team_id && holiday.team_id !== target.team_id)) return c.json(jsonError('Feriado incompatível com a equipe.'), 400)
+  const amount = Number(body.amount)
+  if (![0.5, 1].includes(amount) || !body.note?.trim()) return c.json(jsonError('Informe a quantidade e a justificativa.'), 400)
+  const duplicate = await c.env.DB.prepare(`SELECT id FROM administrative_balance_entries
+    WHERE user_id = ? AND holiday_id = ? AND amount > 0 LIMIT 1`).bind(target.id, holiday.id).first()
+  if (duplicate) return c.json(jsonError('Este colaborador já possui crédito para o feriado informado.'), 409)
+  const id = crypto.randomUUID()
+  await c.env.DB.prepare(`INSERT INTO administrative_balance_entries
+    (id, user_id, holiday_id, amount, entry_type, note, created_by) VALUES (?, ?, ?, ?, 'MANUAL_WORK', ?, ?)`)
+    .bind(id, target.id, holiday.id, amount, body.note.trim(), actor.id).run()
+  await audit(c.env.DB, actor.id, 'CREATE', 'ADMINISTRATIVE_CREDIT', id, body)
+  return c.json({ id }, 201)
+})
+
+function weeklyScope(c: any) {
+  const actor = c.get('user') as User
+  if (actor.role === 'EMPLOYEE') return { error: c.json(jsonError('Acesso restrito.', 403), 403) }
+  const requestedTeamId = c.req.query('teamId') || null
+  return { actor, teamId: actor.role === 'SUPERVISOR' ? actor.team_id : requestedTeamId }
+}
+
+app.get('/api/communications/weekly', async (c) => {
+  const scope = weeklyScope(c); if ('error' in scope) return scope.error
+  const reference = c.req.query('reference') || today()
+  const range = weekRange(reference)
+  const teamClause = scope.teamId ? 'AND u.team_id = ?' : ''
+  const query = c.env.DB.prepare(`SELECT r.*, u.name user_name FROM absence_requests r JOIN users u ON u.id = r.user_id
+    WHERE r.start_date <= ? AND r.end_date >= ? AND r.status NOT IN ('REJECTED', 'CANCELLED') ${teamClause}
+    ORDER BY r.start_date, u.name`)
+  const rows = scope.teamId
+    ? await query.bind(range.nextEnd, range.currentStart, scope.teamId).all<WeeklyRequest>()
+    : await query.bind(range.nextEnd, range.currentStart).all<WeeklyRequest>()
+  const generated = buildWeeklyBody(reference, rows.results)
+  const savedQuery = scope.teamId
+    ? c.env.DB.prepare(`SELECT * FROM weekly_communications WHERE period_start = ? AND team_id = ?`).bind(generated.currentStart, scope.teamId)
+    : c.env.DB.prepare(`SELECT * FROM weekly_communications WHERE period_start = ? AND team_id IS NULL`).bind(generated.currentStart)
+  const communication = await savedQuery.first()
+  return c.json({
+    subject: '[PSE] COMUNICADO SEMANAL DE AUSÊNCIAS', body: (communication as { draft_body?: string } | null)?.draft_body || generated.body,
+    period_start: generated.currentStart, period_end: generated.nextEnd, communication,
+  })
+})
+
+app.post('/api/communications/weekly', async (c) => {
+  const actor = c.get('user')
+  if (actor.role === 'EMPLOYEE') return c.json(jsonError('Acesso restrito.', 403), 403)
+  const body = await c.req.json<{ body: string; period_start: string; period_end: string; team_id?: string | null }>()
+  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id || null
+  if (!body.body?.trim() || !body.period_start || !body.period_end) return c.json(jsonError('O texto e o período são obrigatórios.'), 400)
+  const existingQuery = teamId
+    ? c.env.DB.prepare(`SELECT id FROM weekly_communications WHERE period_start = ? AND team_id = ?`).bind(body.period_start, teamId)
+    : c.env.DB.prepare(`SELECT id FROM weekly_communications WHERE period_start = ? AND team_id IS NULL`).bind(body.period_start)
+  const existing = await existingQuery.first<{ id: string }>()
+  const id = existing?.id || crypto.randomUUID()
+  if (existing) {
+    await c.env.DB.prepare(`UPDATE weekly_communications SET draft_body = ?, period_end = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .bind(body.body.trim(), body.period_end, id).run()
+  } else {
+    await c.env.DB.prepare(`INSERT INTO weekly_communications
+      (id, team_id, period_start, period_end, draft_body, created_by) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(id, teamId, body.period_start, body.period_end, body.body.trim(), actor.id).run()
+  }
+  await audit(c.env.DB, actor.id, 'SAVE_DRAFT', 'WEEKLY_COMMUNICATION', id)
+  return c.json({ id })
+})
+
+app.post('/api/communications/weekly/:id/publish', async (c) => {
+  const actor = c.get('user')
+  if (actor.role === 'EMPLOYEE') return c.json(jsonError('Acesso restrito.', 403), 403)
+  const communication = await c.env.DB.prepare('SELECT * FROM weekly_communications WHERE id = ?').bind(c.req.param('id'))
+    .first<{ id: string; team_id: string | null; subject: string; draft_body: string }>()
+  if (!communication || (actor.role === 'SUPERVISOR' && communication.team_id !== actor.team_id)) return c.json(jsonError('Comunicado não encontrado.', 404), 404)
+  const input = await c.req.json<{ body?: string }>().catch(() => ({} as { body?: string }))
+  const publishedBody = input.body?.trim() || communication.draft_body
+  await c.env.DB.prepare(`UPDATE weekly_communications SET draft_body = ?, published_body = ?, published_by = ?,
+    published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+    .bind(publishedBody, publishedBody, actor.id, communication.id).run()
+  const supervisorQuery = communication.team_id
+    ? c.env.DB.prepare(`SELECT email FROM users WHERE role = 'SUPERVISOR' AND active = 1 AND team_id = ?`).bind(communication.team_id)
+    : c.env.DB.prepare(`SELECT email FROM users WHERE role = 'SUPERVISOR' AND active = 1`)
+  const supervisors = await supervisorQuery.all<{ email: string }>()
+  const results = await Promise.all(supervisors.results.map((supervisor) => sendEmail(c.env.DB, c.env, {
+    recipient: supervisor.email, subject: '[PSE] COMUNICADO SEMANAL DE AUSÊNCIAS', body: publishedBody, communicationId: communication.id,
+  })))
+  await audit(c.env.DB, actor.id, 'PUBLISH', 'WEEKLY_COMMUNICATION', communication.id, { recipients: supervisors.results.length })
+  return c.json({ ok: true, recipients: supervisors.results.length, sent: results.filter((result) => result.status === 'SENT').length, published_body: publishedBody })
 })
 
 app.get('/api/calendar', async (c) => {
@@ -323,7 +619,7 @@ app.get('/api/calendar', async (c) => {
         : c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id ORDER BY t.name, u.active DESC, u.name`)
   const users = await userQuery.all<User>()
   const allRequests = await c.env.DB.prepare(`SELECT r.*, u.team_id, u.name user_name FROM absence_requests r
-    JOIN users u ON u.id = r.user_id WHERE r.status IN ('REQUESTED', 'CONFIRMED') ORDER BY r.start_date`).all<{
+    JOIN users u ON u.id = r.user_id WHERE r.status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED', 'QUANTUM_APPROVED') ORDER BY r.start_date`).all<{
       id: string; user_id: string; user_name: string; team_id: string | null; type: string; start_date: string; end_date: string;
       business_days: number; calendar_days: number; debit_days: number; status: string
     }>()
@@ -355,7 +651,7 @@ app.get('/api/dashboard', async (c) => {
   if (actor.role === 'EMPLOYEE' && target.id !== actor.id) return c.json(jsonError('Acesso restrito.', 403), 403)
   if (actor.role === 'SUPERVISOR' && target.team_id !== actor.team_id) return c.json(jsonError('Acesso restrito.', 403), 403)
   const rows = await c.env.DB.prepare(`SELECT end_date, debit_days, status, type, start_date, business_days, calendar_days
-    FROM absence_requests WHERE user_id = ? AND status IN ('REQUESTED', 'CONFIRMED')`).bind(target.id).all<{
+    FROM absence_requests WHERE user_id = ? AND status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED', 'QUANTUM_APPROVED')`).bind(target.id).all<{
       end_date: string; debit_days: number; status: string; type: string; start_date: string; business_days: number; calendar_days: number
     }>()
   const requests = rows.results.filter((r) => r.type === 'VACATION')
@@ -377,10 +673,17 @@ app.get('/api/dashboard', async (c) => {
     const used = rows.results.filter((r) => r.type === type && r.start_date.startsWith(year)).reduce((s, r) => s + r.business_days, 0)
     return { used, available: Math.max(0, limit - used), limit }
   }
+  const administrativeLedger = await c.env.DB.prepare(`SELECT COALESCE(SUM(amount), 0) balance FROM administrative_balance_entries WHERE user_id = ?`)
+    .bind(target.id).first<{ balance: number }>()
+  const administrativeReserved = await c.env.DB.prepare(`SELECT COALESCE(SUM(administrative_days), 0) total FROM absence_requests
+    WHERE user_id = ? AND type = 'ADMINISTRATIVE' AND status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED')`)
+    .bind(target.id).first<{ total: number }>()
   return c.json({
     currentBalance: Number(current.toFixed(2)),
     projectedYearEnd: Number(vacationBalance(target, endYear, requests, true).toFixed(2)),
-    pendingCount: rows.results.filter((r) => r.status === 'REQUESTED').length,
+    pendingCount: rows.results.filter((r) => r.status !== 'QUANTUM_APPROVED').length,
+    administrativeBalance: Number(Number(administrativeLedger?.balance ?? 0).toFixed(2)),
+    projectedAdministrativeBalance: Number((Number(administrativeLedger?.balance ?? 0) - Number(administrativeReserved?.total ?? 0)).toFixed(2)),
     projection,
     quotas: { justified: quota('JUSTIFIED', 15), unjustified: quota('UNJUSTIFIED', 4) },
   })

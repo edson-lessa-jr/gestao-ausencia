@@ -9,7 +9,7 @@ import { absenceLabels } from '../types'
 
 export default function RequestDrawer({ open, onClose, user, onSaved }: { open: boolean; onClose: () => void; user: User; onSaved: () => void }) {
   const [users, setUsers] = useState<User[]>([])
-  const [form, setForm] = useState({ user_id: user.id, type: 'VACATION' as AbsenceType, start_date: '', end_date: '', reason: '' })
+  const [form, setForm] = useState({ user_id: user.id, type: 'VACATION' as AbsenceType, start_date: '', end_date: '', reason: '', administrative_days: 1 })
   const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
   useEffect(() => { if (open && user.role !== 'EMPLOYEE') void api<{ users: User[] }>('/users').then((r) => { const available = r.users.filter((member) => member.active && (user.role !== 'SUPERVISOR' || member.team_id === user.team_id)); setUsers(available); if (available.length) setForm((f) => ({ ...f, user_id: f.user_id === user.id ? available[0].id : f.user_id })) }) }, [open, user.id, user.role, user.team_id])
   const selected = useMemo(() => users.find((u) => u.id === form.user_id) || user, [users, user, form.user_id])
@@ -31,12 +31,13 @@ export default function RequestDrawer({ open, onClose, user, onSaved }: { open: 
         {error && <Alert severity="error">{error}</Alert>}
         <Alert icon={<InfoOutlined />} severity="info">Férias e ausências comuns contam dias úteis, descontando fins de semana e feriados cadastrados.</Alert>
         {user.role !== 'EMPLOYEE' && <FormControl fullWidth><InputLabel>Colaborador</InputLabel><Select label="Colaborador" value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })}>{users.map((u) => <MenuItem key={u.id} value={u.id}>{u.name} · {u.team_name}</MenuItem>)}</Select></FormControl>}
-        <FormControl fullWidth><InputLabel>Tipo de ausência</InputLabel><Select label="Tipo de ausência" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as AbsenceType })}>{Object.entries(absenceLabels).map(([value, label]) => <MenuItem key={value} value={value}>{label}</MenuItem>)}</Select></FormControl>
+        <FormControl fullWidth><InputLabel>Tipo de ausência</InputLabel><Select label="Tipo de ausência" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as AbsenceType, administrative_days: 1 })}>{Object.entries(absenceLabels).map(([value, label]) => <MenuItem key={value} value={value}>{label}</MenuItem>)}</Select></FormControl>
         <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}><TextField fullWidth label="Data de início" type="date" slotProps={{ inputLabel: { shrink: true } }} value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} /><TextField fullWidth label="Data de término" type="date" slotProps={{ inputLabel: { shrink: true } }} value={form.end_date} onChange={(e) => setForm({ ...form, end_date: e.target.value })} /></Stack>
+        {form.type === 'ADMINISTRATIVE' && estimated && <FormControl fullWidth><InputLabel>Saldo administrativo a utilizar</InputLabel><Select label="Saldo administrativo a utilizar" value={form.administrative_days} onChange={(e) => setForm({ ...form, administrative_days: Number(e.target.value) })}>{Array.from({ length: Math.max(1, estimated.business * 2) }, (_, index) => (index + 1) / 2).map((value) => <MenuItem key={value} value={value}>{value.toLocaleString('pt-BR')} dia(s)</MenuItem>)}</Select></FormControl>}
         <Alert severity="warning">Toda nova ausência será registrada como solicitada e aguardará decisão do supervisor.</Alert>
         <TextField label="Observação" multiline minRows={3} value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} />
         {estimated && <Box sx={{ border: '1px solid', borderColor: 'divider', borderRadius: 2, overflow: 'hidden' }}>
-          <Box sx={{ p: 2 }}><Typography variant="body2" color="text.secondary">Período calculado</Typography><Typography fontWeight={750}>{form.type === 'PATERNITY' || form.type === 'MATERNITY' ? `${estimated.calendar} dias corridos` : `${estimated.business} dias úteis`}</Typography></Box>
+          <Box sx={{ p: 2 }}><Typography variant="body2" color="text.secondary">Período calculado</Typography><Typography fontWeight={750}>{form.type === 'PATERNITY' || form.type === 'MATERNITY' ? `${estimated.calendar} dias corridos` : form.type === 'ADMINISTRATIVE' ? `${form.administrative_days.toLocaleString('pt-BR')} dia(s) de saldo administrativo` : `${estimated.business} dias úteis`}</Typography></Box>
           {form.type === 'VACATION' && <><Divider /><Box sx={{ p: 2 }}><Typography variant="body2" color="text.secondary">Desconto estimado no saldo</Typography><Typography fontWeight={750}>{estimated.debit.toLocaleString('pt-BR')} dias</Typography><Typography variant="caption" color="text.secondary">Fator individual: {selected.vacation_debit_factor}</Typography></Box></>}
         </Box>}
       </Stack>

@@ -1,6 +1,6 @@
 export type Role = 'ADMIN' | 'SUPERVISOR' | 'EMPLOYEE'
-export type RequestStatus = 'REQUESTED' | 'CONFIRMED' | 'REJECTED' | 'CANCELLED'
-export type AbsenceType = 'VACATION' | 'JUSTIFIED' | 'UNJUSTIFIED' | 'PATERNITY' | 'MATERNITY'
+export type RequestStatus = 'REQUESTED' | 'APPROVED' | 'QUANTUM_REGISTERED' | 'QUANTUM_APPROVED' | 'REJECTED' | 'CANCELLED'
+export type AbsenceType = 'VACATION' | 'JUSTIFIED' | 'UNJUSTIFIED' | 'PATERNITY' | 'MATERNITY' | 'ADMINISTRATIVE'
 
 export interface User {
   id: string
@@ -27,6 +27,7 @@ export interface AbsenceRequest {
   business_days: number
   calendar_days: number
   debit_days: number
+  administrative_days: number
   status: RequestStatus
   reason?: string
   team_name?: string
@@ -34,9 +35,10 @@ export interface AbsenceRequest {
 
 export const absenceLabels: Record<AbsenceType, string> = {
   VACATION: 'Férias', JUSTIFIED: 'Ausência justificada', UNJUSTIFIED: 'Ausência não justificada',
-  PATERNITY: 'Licença-paternidade', MATERNITY: 'Licença-maternidade',
+  PATERNITY: 'Licença-paternidade', MATERNITY: 'Licença-maternidade', ADMINISTRATIVE: 'Folga administrativa',
 }
 
 export const statusLabels: Record<RequestStatus, string> = {
-  REQUESTED: 'Solicitada', CONFIRMED: 'Confirmada', REJECTED: 'Rejeitada', CANCELLED: 'Cancelada',
+  REQUESTED: 'Solicitada', APPROVED: 'Aprovada', QUANTUM_REGISTERED: 'Registrada no Quantum',
+  QUANTUM_APPROVED: 'Aprovada no Quantum', REJECTED: 'Rejeitada', CANCELLED: 'Cancelada',
 }

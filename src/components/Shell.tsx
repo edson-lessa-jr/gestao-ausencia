@@ -9,6 +9,8 @@ import CalendarMonthOutlined from '@mui/icons-material/CalendarMonthOutlined'
 import GroupsOutlined from '@mui/icons-material/GroupsOutlined'
 import CelebrationOutlined from '@mui/icons-material/CelebrationOutlined'
 import SettingsOutlined from '@mui/icons-material/SettingsOutlined'
+import AccountBalanceWalletOutlined from '@mui/icons-material/AccountBalanceWalletOutlined'
+import CampaignOutlined from '@mui/icons-material/CampaignOutlined'
 import MenuRounded from '@mui/icons-material/MenuRounded'
 import LogoutRounded from '@mui/icons-material/LogoutRounded'
 import type { User } from '../types'
@@ -20,15 +22,19 @@ const HolidaysPage = lazy(() => import('../pages/HolidaysPage'))
 const TeamPage = lazy(() => import('../pages/TeamPage'))
 const CalendarPage = lazy(() => import('../pages/CalendarPage'))
 const SettingsPage = lazy(() => import('../pages/SettingsPage'))
+const AdministrativeBalancePage = lazy(() => import('../pages/AdministrativeBalancePage'))
+const WeeklyCommunicationPage = lazy(() => import('../pages/WeeklyCommunicationPage'))
 
 const drawerWidth = 236
-type Page = 'dashboard' | 'requests' | 'calendar' | 'team' | 'holidays' | 'settings'
+type Page = 'dashboard' | 'requests' | 'calendar' | 'team' | 'holidays' | 'administrative' | 'communication' | 'settings'
 const items: Array<{ id: Page; label: string; icon: React.ReactNode }> = [
   { id: 'dashboard', label: 'Visão geral', icon: <DashboardOutlined /> },
   { id: 'requests', label: 'Solicitações', icon: <EventNoteOutlined /> },
   { id: 'calendar', label: 'Calendário', icon: <CalendarMonthOutlined /> },
   { id: 'team', label: 'Equipe', icon: <GroupsOutlined /> },
   { id: 'holidays', label: 'Feriados', icon: <CelebrationOutlined /> },
+  { id: 'administrative', label: 'Saldo administrativo', icon: <AccountBalanceWalletOutlined /> },
+  { id: 'communication', label: 'Comunicado semanal', icon: <CampaignOutlined /> },
   { id: 'settings', label: 'Configurações', icon: <SettingsOutlined /> },
 ]
 
@@ -40,12 +46,13 @@ export default function Shell({ user, onLogout }: { user: User; onLogout: () => 
   const content: Record<Page, React.ReactNode> = {
     dashboard: <DashboardPage user={user} />, requests: <RequestsPage user={user} />,
     calendar: <CalendarPage user={user} />, team: <TeamPage user={user} />,
-    holidays: <HolidaysPage user={user} />, settings: <SettingsPage user={user} />,
+    holidays: <HolidaysPage user={user} />, administrative: <AdministrativeBalancePage user={user} />,
+    communication: <WeeklyCommunicationPage user={user} />, settings: <SettingsPage user={user} />,
   }
   const nav = <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', bgcolor: '#f1f8fb' }}>
     <Box sx={{ height: 80, display: 'flex', alignItems: 'center', px: 2.5 }}><Box component="img" src="/logo.png" alt="Símbolo" sx={{ width: 48, height: 48, objectFit: 'contain' }} /></Box>
     <List sx={{ px: 1.5, pt: 2 }}>
-      {items.filter((item) => user.role !== 'EMPLOYEE' || !['team', 'holidays', 'settings'].includes(item.id)).map((item) => <ListItemButton key={item.id} selected={page === item.id} onClick={() => { setPage(item.id); setMobileOpen(false) }} sx={{ mb: .75, borderRadius: 1.5, '&.Mui-selected': { bgcolor: '#dceff7', color: 'primary.main' } }}>
+      {items.filter((item) => user.role !== 'EMPLOYEE' || !['team', 'holidays', 'communication', 'settings'].includes(item.id)).map((item) => <ListItemButton key={item.id} selected={page === item.id} onClick={() => { setPage(item.id); setMobileOpen(false) }} sx={{ mb: .75, borderRadius: 1.5, '&.Mui-selected': { bgcolor: '#dceff7', color: 'primary.main' } }}>
         <ListItemIcon sx={{ minWidth: 42, color: 'inherit' }}>{item.icon}</ListItemIcon><ListItemText primary={item.label} primaryTypographyProps={{ fontSize: 14, fontWeight: page === item.id ? 700 : 550 }} />
       </ListItemButton>)}
     </List>
