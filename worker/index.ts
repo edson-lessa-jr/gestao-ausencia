@@ -146,6 +146,66 @@ function buildWeeklyBody(reference: string, requests: WeeklyRequest[]) {
   }
 }
 
+const weeklySubject = '[PSE] COMUNICADO SEMANAL DE AUSÊNCIAS'
+
+async function sendWeeklyEmailOnce(db: D1Database, env: Bindings, communicationId: string, recipient: string, body: string) {
+  const alreadySent = await db.prepare(`SELECT id FROM email_notifications
+    WHERE communication_id = ? AND recipient = ? COLLATE NOCASE AND subject = ? AND body = ? AND status = 'SENT' LIMIT 1`)
+    .bind(communicationId, recipient, weeklySubject, body).first()
+  if (alreadySent) return { status: 'ALREADY_SENT' as const }
+  return sendEmail(db, env, { recipient, subject: weeklySubject, body, communicationId })
+}
+
+async function publishScheduledWeeklyCommunications(env: Bindings, scheduledAt: Date) {
+  const reference = isoDate(scheduledAt)
+  const generatedRange = weekRange(reference)
+  const fallbackAdmin = await env.DB.prepare(`SELECT id FROM users WHERE role = 'ADMIN' AND active = 1
+    ORDER BY created_at LIMIT 1`).first<{ id: string }>()
+  if (!fallbackAdmin) throw new Error('Não existe administrador ativo para registrar a publicação automática.')
+
+  const teams = await env.DB.prepare('SELECT id FROM teams ORDER BY name').all<{ id: string }>()
+  for (const team of teams.results) {
+    const supervisors = await env.DB.prepare(`SELECT id, email FROM users
+      WHERE role = 'SUPERVISOR' AND active = 1 AND team_id = ? ORDER BY name`)
+      .bind(team.id).all<{ id: string; email: string }>()
+    const actorId = supervisors.results[0]?.id || fallbackAdmin.id
+    const requests = await env.DB.prepare(`SELECT r.*, u.name user_name FROM absence_requests r
+      JOIN users u ON u.id = r.user_id
+      WHERE r.start_date <= ? AND r.end_date >= ? AND r.status NOT IN ('REJECTED', 'CANCELLED')
+        AND r.type = 'VACATION' AND u.team_id = ?
+      ORDER BY r.start_date, u.name`)
+      .bind(generatedRange.nextEnd, generatedRange.currentStart, team.id).all<WeeklyRequest>()
+    const generated = buildWeeklyBody(reference, requests.results)
+    const existing = await env.DB.prepare(`SELECT id, draft_body, published_body, published_at
+      FROM weekly_communications WHERE period_start = ? AND team_id = ?`)
+      .bind(generated.currentStart, team.id).first<{
+        id: string; draft_body: string; published_body: string | null; published_at: string | null
+      }>()
+    const communicationId = existing?.id || crypto.randomUUID()
+    const publishedBody = generated.body
+
+    if (!existing) {
+      await env.DB.prepare(`INSERT INTO weekly_communications
+        (id, team_id, period_start, period_end, subject, draft_body, published_body, created_by, published_by, published_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+        .bind(communicationId, team.id, generated.currentStart, generated.nextEnd, weeklySubject,
+          publishedBody, publishedBody, actorId, actorId).run()
+    } else {
+      await env.DB.prepare(`UPDATE weekly_communications SET draft_body = ?, published_body = ?, published_by = ?,
+        published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+        .bind(publishedBody, publishedBody, actorId, communicationId).run()
+    }
+
+    const results = await Promise.all(supervisors.results.map((supervisor) =>
+      sendWeeklyEmailOnce(env.DB, env, communicationId, supervisor.email, publishedBody)))
+    await audit(env.DB, actorId, 'AUTO_PUBLISH', 'WEEKLY_COMMUNICATION', communicationId, {
+      recipients: supervisors.results.length,
+      sent: results.filter((result) => result.status === 'SENT').length,
+      alreadySent: results.filter((result) => result.status === 'ALREADY_SENT').length,
+    })
+  }
+}
+
 async function audit(db: D1Database, actorId: string | null, action: string, entityType: string, entityId?: string, payload?: unknown) {
   await db.prepare(`INSERT INTO audit_logs (id, actor_id, action, entity_type, entity_id, payload) VALUES (?, ?, ?, ?, ?, ?)`)
     .bind(crypto.randomUUID(), actorId, action, entityType, entityId ?? null, payload ? JSON.stringify(payload) : null).run()
@@ -696,4 +756,9 @@ app.onError((error, c) => {
   return c.json(jsonError('Erro interno ao processar a operação.', 500), 500)
 })
 
-export default app
+export default {
+  fetch: app.fetch,
+  async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
+    ctx.waitUntil(publishScheduledWeeklyCommunications(env, new Date(controller.scheduledTime)))
+  },
+}

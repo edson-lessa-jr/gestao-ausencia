@@ -81,6 +81,17 @@ npx wrangler secret put EMAIL_FROM
 
 `EMAIL_FROM` deve ser um remetente autorizado no Resend, por exemplo `Gestão de ausências <ausencias@seudominio.br>`. Sem essas configurações, a operação continua funcionando e a tentativa fica registrada como `SKIPPED` no banco para auditoria.
 
+## Comunicado semanal automático
+
+O Worker possui um Cron Trigger configurado para executar toda segunda-feira às 12h UTC, equivalente a 9h no horário de Brasília. Para cada equipe, o processo:
+
+1. gera automaticamente o texto com as férias da semana atual e da próxima, sem etapa de revisão;
+2. salva a versão publicada do comunicado;
+3. envia a mesma mensagem aos supervisores ativos da equipe;
+4. evita reenviar o mesmo texto a um supervisor quando o evento agendado for repetido.
+
+A cópia e a publicação no Microsoft Teams continuam manuais.
+
 ## Segurança
 
 - Não existem senhas padrão no repositório.
