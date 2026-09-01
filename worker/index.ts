@@ -431,7 +431,7 @@ app.get('/api/status', async (c) => {
 app.post('/api/setup', async (c) => {
   const existing = await c.env.DB.prepare('SELECT COUNT(*) AS count FROM users').first<{ count: number }>()
   if (Number(existing?.count ?? 0) > 0) return c.json(jsonError('A configuração inicial já foi realizada.', 409), 409)
-  const body = await c.req.json<{ name: string; email: string; communication_email?: string; password: string; teamName?: string }>()
+  const body = await c.req.json<{ name: string; email: string; communication_email?: string; password: string }>()
   if (!body.name || !body.email || !body.password || body.password.length < 10) {
     return c.json(jsonError('Informe nome, e-mail e uma senha com pelo menos 10 caracteres.'), 400)
   }
@@ -439,16 +439,13 @@ app.post('/api/setup', async (c) => {
   const communicationEmail = cleanEmail(body.communication_email || '') || null
   const conflict = await emailConflict(c.env.DB, registrationEmail, communicationEmail)
   if (conflict) return c.json(jsonError(conflict), 400)
-  const teamId = crypto.randomUUID()
   const userId = crypto.randomUUID()
   const salt = crypto.randomUUID()
-  await c.env.DB.batch([
-    c.env.DB.prepare('INSERT INTO teams (id, name) VALUES (?, ?)').bind(teamId, body.teamName?.trim() || 'Equipe principal'),
-    c.env.DB.prepare(`INSERT INTO users
-      (id, name, email, communication_email, password_hash, password_salt, role, team_id, hire_date, balance_start_date)
-      VALUES (?, ?, ?, ?, ?, ?, 'ADMIN', ?, ?, ?)`)
-      .bind(userId, body.name.trim(), registrationEmail, communicationEmail, await passwordHash(body.password, salt), salt, teamId, today(), today()),
-  ])
+  await c.env.DB.prepare(`INSERT INTO users
+    (id, name, email, communication_email, password_hash, password_salt, role, team_id, hire_date, balance_start_date)
+    VALUES (?, ?, ?, ?, ?, ?, 'ADMIN', NULL, ?, ?)`)
+    .bind(userId, body.name.trim(), registrationEmail, communicationEmail,
+      await passwordHash(body.password, salt), salt, today(), today()).run()
   await audit(c.env.DB, userId, 'SETUP', 'SYSTEM')
   return c.json({ ok: true }, 201)
 })
@@ -520,9 +517,9 @@ app.post('/api/users', async (c) => {
   const actor = c.get('user')
   if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
   const body = await c.req.json<Partial<User> & { password: string }>()
-  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id
   const role = actor.role === 'SUPERVISOR' ? 'EMPLOYEE' : body.role
-  if (!body.name || !body.email || !body.password || !teamId || !role) return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
+  const teamId = role === 'ADMIN' ? null : actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id
+  if (!body.name || !body.email || !body.password || !role || (role !== 'ADMIN' && !teamId)) return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
   if (body.password.length < 10) return c.json(jsonError('A senha temporária deve ter pelo menos 10 caracteres.'), 400)
   const openingBalance = Number(body.opening_vacation_balance ?? 0)
   if (!Number.isFinite(openingBalance) || openingBalance < 0 || !hasAtMostTwoDecimals(openingBalance)) {
@@ -553,8 +550,8 @@ app.patch('/api/users/:id', async (c) => {
   const body = await c.req.json<Partial<User> & { password?: string }>()
   if (body.role && !['ADMIN', 'SUPERVISOR', 'EMPLOYEE'].includes(body.role)) return c.json(jsonError('Perfil inválido.'), 400)
   const role = actor.role === 'ADMIN' && body.role ? body.role : target.role
-  const teamId = actor.role === 'SUPERVISOR' ? target.team_id : body.team_id
-  if (!body.name || !body.email || !teamId || !body.hire_date || !body.balance_start_date) {
+  const teamId = role === 'ADMIN' ? null : actor.role === 'SUPERVISOR' ? target.team_id : body.team_id
+  if (!body.name || !body.email || (role !== 'ADMIN' && !teamId) || !body.hire_date || !body.balance_start_date) {
     return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
   }
   const openingBalance = Number(body.opening_vacation_balance ?? 0)
@@ -755,6 +752,7 @@ app.post('/api/requests', async (c) => {
   const userId = actor.role === 'EMPLOYEE' ? actor.id : body.user_id || actor.id
   const target = await c.env.DB.prepare('SELECT * FROM users WHERE id = ? AND active = 1').bind(userId).first<User>()
   if (!target) return c.json(jsonError('Colaborador não encontrado.', 404), 404)
+  if (target.role === 'ADMIN') return c.json(jsonError('A conta administrativa não registra ausências.'), 403)
   if (actor.role === 'SUPERVISOR' && target.team_id !== actor.team_id) return c.json(jsonError('Colaborador fora da sua equipe.', 403), 403)
   if (!body.start_date || !body.end_date || body.end_date < body.start_date) return c.json(jsonError('Período inválido.'), 400)
   const calDays = calendarDays(body.start_date, body.end_date)
@@ -979,8 +977,8 @@ app.get('/api/calendar', async (c) => {
     : actor.role === 'SUPERVISOR'
       ? c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id WHERE u.team_id = ? ORDER BY u.active DESC, u.name`).bind(actor.team_id)
       : requestedTeamId
-        ? c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id WHERE u.team_id = ? ORDER BY u.active DESC, u.name`).bind(requestedTeamId)
-        : c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id ORDER BY t.name, u.active DESC, u.name`)
+        ? c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id WHERE u.team_id = ? AND u.role <> 'ADMIN' ORDER BY u.active DESC, u.name`).bind(requestedTeamId)
+        : c.env.DB.prepare(`SELECT u.*, t.name team_name FROM users u LEFT JOIN teams t ON t.id = u.team_id WHERE u.role <> 'ADMIN' ORDER BY t.name, u.active DESC, u.name`)
   const users = await userQuery.all<User>()
   const allRequests = await c.env.DB.prepare(`SELECT r.*, u.team_id, u.name user_name FROM absence_requests r
     JOIN users u ON u.id = r.user_id WHERE r.status IN ('REQUESTED', 'APPROVED', 'QUANTUM_REGISTERED', 'QUANTUM_APPROVED') ORDER BY r.start_date`).all<{
