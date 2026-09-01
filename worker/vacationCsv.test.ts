@@ -26,4 +26,12 @@ em duas linhas e ignorada"`
     expect(row.name).toBe('Nome; Composto')
     expect(row).not.toHaveProperty('notes')
   })
+
+  it('separa o e-mail de registro do e-mail de comunicação quando ambos estão no CSV', () => {
+    const csv = `E-mail de registro;E-mail de comunicação;Nome;Data de Início;Data Final;Número de dias úteis;Saldo de férias atual no último PaySlip
+junior@undp.org;junior@cnj.jus.br;Junior Teste;10/11/2026;13/11/2026;4;12,5`
+    const [row] = parseVacationCsv(csv)
+    expect(row.email).toBe('junior@undp.org')
+    expect(row.communication_email).toBe('junior@cnj.jus.br')
+  })
 })

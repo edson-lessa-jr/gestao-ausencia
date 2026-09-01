@@ -8,7 +8,7 @@ import { supersededOverlaps } from './import-rules'
 type Bindings = { DB: D1Database; ASSETS: Fetcher; RESEND_API_KEY?: string; EMAIL_FROM?: string }
 type Role = 'ADMIN' | 'SUPERVISOR' | 'EMPLOYEE'
 type User = {
-  id: string; name: string; email: string; role: Role; team_id: string | null; team_name?: string | null
+  id: string; name: string; email: string; communication_email: string | null; role: Role; team_id: string | null; team_name?: string | null
   hire_date: string; balance_start_date: string; opening_vacation_balance: number
   monthly_accrual: number; vacation_debit_factor: number; active: number
 }
@@ -18,6 +18,7 @@ type VacationImportRow = {
   external_id?: string
   submitted_at?: string
   email: string
+  communication_email?: string
   name: string
   start_date: string
   end_date: string
@@ -28,6 +29,8 @@ type VacationImportRow = {
 type VacationImportItem = VacationImportRow & {
   action: 'CREATE' | 'EXISTING' | 'SKIP' | 'REVIEW' | 'ERROR'
   message: string
+  user_id?: string
+  matched_by?: 'EMAIL' | 'NAME'
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: User } }>()
@@ -43,11 +46,26 @@ const isIsoDate = (value: string) => {
   return !Number.isNaN(parsed.getTime()) && isoDate(parsed) === value
 }
 const cleanEmail = (value: string) => value.trim().replace('\\@', '@').toLowerCase()
+const validEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+const normalizedName = (value: string) => value.trim().toLowerCase().normalize('NFD')
+  .replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ')
 const displayNameFromEmail = (email: string) => email.split('@')[0].split(/[._-]+/).filter(Boolean)
   .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join(' ')
 const submittedAtKey = (value?: string) => {
   const match = value?.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})/)
   return match ? `${match[3]}${match[2]}${match[1]}${match[4]}${match[5]}` : ''
+}
+
+async function emailConflict(db: D1Database, registrationEmail: string, communicationEmail?: string | null, excludedId = '') {
+  if (!validEmail(registrationEmail)) return 'Informe um e-mail de registro válido.'
+  if (communicationEmail && !validEmail(communicationEmail)) return 'Informe um e-mail de comunicação válido.'
+  if (communicationEmail && registrationEmail === communicationEmail) return 'Os e-mails de registro e comunicação devem ser diferentes.'
+  const existing = await db.prepare(`SELECT id FROM users WHERE id <> ? AND (
+    lower(email) = lower(?) OR lower(COALESCE(communication_email, '')) = lower(?)
+    OR (? <> '' AND (lower(email) = lower(?) OR lower(COALESCE(communication_email, '')) = lower(?)))
+  ) LIMIT 1`).bind(excludedId, registrationEmail, registrationEmail, communicationEmail || '', communicationEmail || '', communicationEmail || '')
+    .first<{ id: string }>()
+  return existing ? 'Um dos e-mails já pertence a outro usuário.' : null
 }
 
 function bytesToHex(bytes: Uint8Array) {
@@ -116,13 +134,13 @@ async function sendEmail(
 }
 
 async function notifyRequestStatus(db: D1Database, env: Bindings, requestId: string, actorName: string, note?: string) {
-  const request = await db.prepare(`SELECT r.*, u.name user_name, u.email FROM absence_requests r
+  const request = await db.prepare(`SELECT r.*, u.name user_name, COALESCE(NULLIF(u.communication_email, ''), u.email) recipient_email FROM absence_requests r
     JOIN users u ON u.id = r.user_id WHERE r.id = ?`).bind(requestId).first<{
-      id: string; type: string; start_date: string; end_date: string; status: string; user_name: string; email: string
+      id: string; type: string; start_date: string; end_date: string; status: string; user_name: string; recipient_email: string
     }>()
   if (!request) return { status: 'SKIPPED' as const }
   const body = `Olá, ${request.user_name}.\n\nSua solicitação de ${absenceLabels[request.type]}, referente ao período de ${formatDateBr(request.start_date)} a ${formatDateBr(request.end_date)}, foi atualizada.\n\nNovo status: ${statusLabels[request.status]}\nAtualizado por: ${actorName}\nData da atualização: ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}${note ? `\n\nObservação:\n${note}` : ''}`
-  return sendEmail(db, env, { recipient: request.email, subject: 'Atualização da sua solicitação de ausência', body, requestId })
+  return sendEmail(db, env, { recipient: request.recipient_email, subject: 'Atualização da sua solicitação de ausência', body, requestId })
 }
 
 async function applyFinalBalanceEntries(db: D1Database, requestId: string, actorId: string) {
@@ -198,7 +216,7 @@ async function publishScheduledWeeklyCommunications(env: Bindings, scheduledAt: 
 
   const teams = await env.DB.prepare('SELECT id FROM teams ORDER BY name').all<{ id: string }>()
   for (const team of teams.results) {
-    const supervisors = await env.DB.prepare(`SELECT id, email FROM users
+    const supervisors = await env.DB.prepare(`SELECT id, COALESCE(NULLIF(communication_email, ''), email) email FROM users
       WHERE role = 'SUPERVISOR' AND active = 1 AND team_id = ? ORDER BY name`)
       .bind(team.id).all<{ id: string; email: string }>()
     const actorId = supervisors.results[0]?.id || fallbackAdmin.id
@@ -256,11 +274,13 @@ async function analyzeVacationImport(db: D1Database, actor: User, teamId: string
 
   const rows: VacationImportItem[] = sourceRows.map((source, index) => {
     const email = cleanEmail(String(source.email || ''))
+    const communicationEmail = cleanEmail(String(source.communication_email || '')) || undefined
     const suppliedName = String(source.name || '').trim()
     const name = !suppliedName || suppliedName.includes('@') ? displayNameFromEmail(email) : suppliedName
     return {
       line: Number(source.line || index + 2), external_id: String(source.external_id || '').trim() || undefined,
-      submitted_at: String(source.submitted_at || '').trim() || undefined, email, name,
+      submitted_at: String(source.submitted_at || '').trim() || undefined, email,
+      communication_email: communicationEmail, name,
       start_date: String(source.start_date || '').trim(), end_date: String(source.end_date || '').trim(),
       business_days: typeof source.business_days === 'number' ? source.business_days : Number.NaN,
       opening_balance: typeof source.opening_balance === 'number' ? source.opening_balance : Number.NaN,
@@ -276,19 +296,68 @@ async function analyzeVacationImport(db: D1Database, actor: User, teamId: string
     if (!current || rowKey >= currentKey!) latestByEmail.set(row.email, row)
   }
 
-  const allUsers = await db.prepare('SELECT id, name, email, team_id FROM users').all<Pick<User, 'id' | 'name' | 'email' | 'team_id'>>()
-  const userByEmail = new Map(allUsers.results.map((user) => [user.email.toLowerCase(), user]))
+  const allUsers = await db.prepare('SELECT id, name, email, communication_email, team_id FROM users')
+    .all<Pick<User, 'id' | 'name' | 'email' | 'communication_email' | 'team_id'>>()
+  const userByAnyEmail = new Map<string, typeof allUsers.results[number]>()
+  for (const existing of allUsers.results) {
+    userByAnyEmail.set(existing.email.toLowerCase(), existing)
+    if (existing.communication_email) userByAnyEmail.set(existing.communication_email.toLowerCase(), existing)
+  }
+  const teamUsersByName = new Map<string, typeof allUsers.results>()
+  for (const existing of allUsers.results.filter((item) => item.team_id === teamId)) {
+    const key = normalizedName(existing.name)
+    teamUsersByName.set(key, [...(teamUsersByName.get(key) || []), existing])
+  }
   const users = [...latestByEmail.values()].map((row): VacationImportItem => {
-    if (!row.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) return { ...row, action: 'ERROR', message: 'E-mail inválido.' }
+    if (!row.email || !validEmail(row.email)) return { ...row, action: 'ERROR', message: 'E-mail de registro inválido.' }
+    if (row.communication_email && !validEmail(row.communication_email)) return { ...row, action: 'ERROR', message: 'E-mail de comunicação inválido.' }
+    if (row.communication_email === row.email) return { ...row, action: 'ERROR', message: 'Os e-mails de registro e comunicação devem ser diferentes.' }
     if (!row.name) return { ...row, action: 'ERROR', message: 'Nome não identificado.' }
     if (!Number.isFinite(row.opening_balance) || row.opening_balance < 0 || !hasAtMostTwoDecimals(row.opening_balance)) {
       return { ...row, action: 'ERROR', message: 'O saldo deve ser positivo e possuir no máximo duas casas decimais.' }
     }
-    const existing = userByEmail.get(row.email)
+    const directRegistration = userByAnyEmail.get(row.email)
+    const directCommunication = row.communication_email ? userByAnyEmail.get(row.communication_email) : undefined
+    if (directRegistration && directCommunication && directRegistration.id !== directCommunication.id) {
+      return { ...row, action: 'ERROR', message: 'Os e-mails informados pertencem a usuários diferentes.' }
+    }
+    let existing = directRegistration || directCommunication
+    let matchedBy: 'EMAIL' | 'NAME' = 'EMAIL'
+    if (!existing) {
+      const nameMatches = teamUsersByName.get(normalizedName(row.name)) || []
+      if (nameMatches.length > 1) return { ...row, action: 'ERROR', message: 'Há mais de um colaborador com este nome na equipe; informe os dois e-mails no CSV.' }
+      existing = nameMatches[0]
+      matchedBy = 'NAME'
+    }
     if (existing && existing.team_id !== teamId) return { ...row, action: 'ERROR', message: 'O e-mail já pertence a outra equipe.' }
-    if (existing) return { ...row, action: 'EXISTING', message: 'Colaborador já cadastrado; seus dados e saldo não serão alterados.' }
+    if (existing) {
+      const registrationOwner = userByAnyEmail.get(row.email)
+      const communicationOwner = row.communication_email ? userByAnyEmail.get(row.communication_email) : undefined
+      if ((registrationOwner && registrationOwner.id !== existing.id) || (communicationOwner && communicationOwner.id !== existing.id)) {
+        return { ...row, action: 'ERROR', message: 'Um dos e-mails já pertence a outro usuário.' }
+      }
+      const inferredCommunication = !row.communication_email && matchedBy === 'NAME' && existing.email.endsWith('@cnj.jus.br')
+        ? existing.email : row.communication_email || existing.communication_email || undefined
+      return {
+        ...row, communication_email: inferredCommunication, user_id: existing.id, matched_by: matchedBy,
+        action: 'EXISTING',
+        message: matchedBy === 'NAME'
+          ? 'Colaborador associado pelo nome; o e-mail de registro será atualizado.'
+          : 'Colaborador já cadastrado; e-mails ausentes serão complementados.',
+      }
+    }
     return { ...row, opening_balance: round2(row.opening_balance), action: 'CREATE', message: 'Novo colaborador.' }
   })
+  const desiredEmailOwner = new Map<string, VacationImportItem>()
+  for (const item of users.filter((candidate) => candidate.action !== 'ERROR')) {
+    for (const candidateEmail of [item.email, item.communication_email].filter(Boolean) as string[]) {
+      const prior = desiredEmailOwner.get(candidateEmail)
+      if (prior && prior.email !== item.email) {
+        item.action = 'ERROR'; item.message = 'O mesmo e-mail foi informado para mais de um colaborador no CSV.'
+        prior.action = 'ERROR'; prior.message = item.message
+      } else desiredEmailOwner.set(candidateEmail, item)
+    }
+  }
   const userResultByEmail = new Map(users.map((row) => [row.email, row]))
 
   for (const row of rows) {
@@ -310,7 +379,7 @@ async function analyzeVacationImport(db: D1Database, actor: User, teamId: string
     const userResult = userResultByEmail.get(row.email)
     if (!userResult || userResult.action === 'ERROR') {
       row.action = 'ERROR'; row.message = userResult?.message || 'Colaborador inválido.'
-    }
+    } else row.user_id = userResult.user_id
   }
 
   const superseded = supersededOverlaps(rows.filter((item) => item.action === 'CREATE'))
@@ -324,7 +393,7 @@ async function analyzeVacationImport(db: D1Database, actor: User, teamId: string
     WHERE r.type = 'VACATION' AND r.status NOT IN ('REJECTED', 'CANCELLED') AND u.team_id = ?`)
     .bind(teamId).all<{ id: string; user_id: string; start_date: string; end_date: string; email: string }>()
   for (const row of rows.filter((item) => item.action === 'CREATE')) {
-    const matches = existingRequests.results.filter((item) => item.email.toLowerCase() === row.email
+    const matches = existingRequests.results.filter((item) => (row.user_id ? item.user_id === row.user_id : item.email.toLowerCase() === row.email)
       && row.start_date <= item.end_date && row.end_date >= item.start_date)
     if (matches.some((item) => item.start_date === row.start_date && item.end_date === row.end_date)) {
       row.action = 'SKIP'; row.message = 'Solicitação já cadastrada.'
@@ -362,19 +431,23 @@ app.get('/api/status', async (c) => {
 app.post('/api/setup', async (c) => {
   const existing = await c.env.DB.prepare('SELECT COUNT(*) AS count FROM users').first<{ count: number }>()
   if (Number(existing?.count ?? 0) > 0) return c.json(jsonError('A configuração inicial já foi realizada.', 409), 409)
-  const body = await c.req.json<{ name: string; email: string; password: string; teamName?: string }>()
+  const body = await c.req.json<{ name: string; email: string; communication_email?: string; password: string; teamName?: string }>()
   if (!body.name || !body.email || !body.password || body.password.length < 10) {
     return c.json(jsonError('Informe nome, e-mail e uma senha com pelo menos 10 caracteres.'), 400)
   }
+  const registrationEmail = cleanEmail(body.email)
+  const communicationEmail = cleanEmail(body.communication_email || '') || null
+  const conflict = await emailConflict(c.env.DB, registrationEmail, communicationEmail)
+  if (conflict) return c.json(jsonError(conflict), 400)
   const teamId = crypto.randomUUID()
   const userId = crypto.randomUUID()
   const salt = crypto.randomUUID()
   await c.env.DB.batch([
     c.env.DB.prepare('INSERT INTO teams (id, name) VALUES (?, ?)').bind(teamId, body.teamName?.trim() || 'Equipe principal'),
     c.env.DB.prepare(`INSERT INTO users
-      (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date)
-      VALUES (?, ?, ?, ?, ?, 'ADMIN', ?, ?, ?)`)
-      .bind(userId, body.name.trim(), body.email.trim().toLowerCase(), await passwordHash(body.password, salt), salt, teamId, today(), today()),
+      (id, name, email, communication_email, password_hash, password_salt, role, team_id, hire_date, balance_start_date)
+      VALUES (?, ?, ?, ?, ?, ?, 'ADMIN', ?, ?, ?)`)
+      .bind(userId, body.name.trim(), registrationEmail, communicationEmail, await passwordHash(body.password, salt), salt, teamId, today(), today()),
   ])
   await audit(c.env.DB, userId, 'SETUP', 'SYSTEM')
   return c.json({ ok: true }, 201)
@@ -382,8 +455,9 @@ app.post('/api/setup', async (c) => {
 
 app.post('/api/auth/login', async (c) => {
   const body = await c.req.json<{ email: string; password: string }>()
-  const row = await c.env.DB.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE AND active = 1')
-    .bind(body.email?.trim()).first<User & { password_hash: string; password_salt: string }>()
+  const row = await c.env.DB.prepare(`SELECT * FROM users
+    WHERE (email = ? COLLATE NOCASE OR communication_email = ? COLLATE NOCASE) AND active = 1`)
+    .bind(body.email?.trim(), body.email?.trim()).first<User & { password_hash: string; password_salt: string }>()
   if (!row || await passwordHash(body.password ?? '', row.password_salt) !== row.password_hash) {
     return c.json(jsonError('E-mail ou senha inválidos.', 401), 401)
   }
@@ -435,7 +509,7 @@ app.post('/api/teams', async (c) => {
 app.get('/api/users', async (c) => {
   const actor = c.get('user')
   const condition = actor.role === 'EMPLOYEE' ? 'WHERE u.id = ?' : actor.role === 'SUPERVISOR' ? 'WHERE u.team_id = ?' : ''
-  const query = c.env.DB.prepare(`SELECT u.id, u.name, u.email, u.role, u.team_id, t.name team_name, u.active,
+  const query = c.env.DB.prepare(`SELECT u.id, u.name, u.email, u.communication_email, u.role, u.team_id, t.name team_name, u.active,
     u.hire_date, u.balance_start_date, u.opening_vacation_balance, u.monthly_accrual, u.vacation_debit_factor
     FROM users u LEFT JOIN teams t ON t.id = u.team_id ${condition} ORDER BY u.name`)
   const rows = actor.role === 'ADMIN' ? await query.all<User>() : await query.bind(actor.role === 'EMPLOYEE' ? actor.id : actor.team_id).all<User>()
@@ -454,11 +528,15 @@ app.post('/api/users', async (c) => {
   if (!Number.isFinite(openingBalance) || openingBalance < 0 || !hasAtMostTwoDecimals(openingBalance)) {
     return c.json(jsonError('O saldo inicial deve ser positivo e possuir no máximo duas casas decimais.'), 400)
   }
+  const registrationEmail = cleanEmail(body.email)
+  const communicationEmail = cleanEmail(body.communication_email || '') || null
+  const conflict = await emailConflict(c.env.DB, registrationEmail, communicationEmail)
+  if (conflict) return c.json(jsonError(conflict), 409)
   const id = crypto.randomUUID(); const salt = crypto.randomUUID()
   await c.env.DB.prepare(`INSERT INTO users
-    (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date, opening_vacation_balance, monthly_accrual, vacation_debit_factor)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(id, body.name.trim(), body.email.trim().toLowerCase(), await passwordHash(body.password, salt), salt, role, teamId,
+    (id, name, email, communication_email, password_hash, password_salt, role, team_id, hire_date, balance_start_date, opening_vacation_balance, monthly_accrual, vacation_debit_factor)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, body.name.trim(), registrationEmail, communicationEmail, await passwordHash(body.password, salt), salt, role, teamId,
       body.hire_date || today(), body.balance_start_date || today(), round2(openingBalance), Number(body.monthly_accrual || 2.5), Number(body.vacation_debit_factor || 1)).run()
   await audit(c.env.DB, actor.id, 'CREATE', 'USER', id, { ...body, password: undefined })
   return c.json({ id }, 201)
@@ -483,16 +561,20 @@ app.patch('/api/users/:id', async (c) => {
   if (!Number.isFinite(openingBalance) || openingBalance < 0 || !hasAtMostTwoDecimals(openingBalance)) {
     return c.json(jsonError('O saldo inicial deve ser positivo e possuir no máximo duas casas decimais.'), 400)
   }
+  const registrationEmail = cleanEmail(body.email)
+  const communicationEmail = cleanEmail(body.communication_email || '') || null
+  const conflict = await emailConflict(c.env.DB, registrationEmail, communicationEmail, target.id)
+  if (conflict) return c.json(jsonError(conflict), 409)
   if (target.id === actor.id && !body.active) return c.json(jsonError('Você não pode inativar a própria conta.'), 409)
   if (target.role === 'ADMIN' && !body.active) {
     const admins = await c.env.DB.prepare(`SELECT COUNT(*) count FROM users WHERE role = 'ADMIN' AND active = 1 AND id <> ?`)
       .bind(target.id).first<{ count: number }>()
     if (Number(admins?.count ?? 0) === 0) return c.json(jsonError('O sistema deve manter pelo menos um administrador ativo.'), 409)
   }
-  const statements = [c.env.DB.prepare(`UPDATE users SET name = ?, email = ?, role = ?, team_id = ?, active = ?,
+  const statements = [c.env.DB.prepare(`UPDATE users SET name = ?, email = ?, communication_email = ?, role = ?, team_id = ?, active = ?,
     hire_date = ?, balance_start_date = ?, opening_vacation_balance = ?, monthly_accrual = ?, vacation_debit_factor = ?,
     updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(
-      body.name.trim(), body.email.trim().toLowerCase(), role, teamId, body.active ? 1 : 0,
+      body.name.trim(), registrationEmail, communicationEmail, role, teamId, body.active ? 1 : 0,
       body.hire_date, body.balance_start_date, round2(openingBalance),
       Number(body.monthly_accrual ?? 2.5), Number(body.vacation_debit_factor ?? 1), target.id,
     )]
@@ -530,15 +612,20 @@ app.post('/api/users/vacation-import', async (c) => {
   try {
     const preview = await analyzeVacationImport(c.env.DB, actor, teamId, body.rows)
     const usersToCreate = preview.users.filter((item) => item.action === 'CREATE')
+    const usersToUpdate = preview.users.filter((item) => item.action === 'EXISTING' && item.user_id)
     const defaultPassword = '1234567890'
     const userStatements: D1PreparedStatement[] = []
+    for (const item of usersToUpdate) {
+      userStatements.push(c.env.DB.prepare(`UPDATE users SET email = ?, communication_email = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`).bind(item.email, item.communication_email || null, item.user_id))
+    }
     for (const item of usersToCreate) {
       const id = crypto.randomUUID(); const salt = crypto.randomUUID()
       userStatements.push(c.env.DB.prepare(`INSERT INTO users
-        (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date,
+        (id, name, email, communication_email, password_hash, password_salt, role, team_id, hire_date, balance_start_date,
           opening_vacation_balance, monthly_accrual, vacation_debit_factor)
-        VALUES (?, ?, ?, ?, ?, 'EMPLOYEE', ?, ?, ?, ?, 2.5, 1)`)
-        .bind(id, item.name.trim(), item.email, await passwordHash(defaultPassword, salt), salt, teamId,
+        VALUES (?, ?, ?, ?, ?, ?, 'EMPLOYEE', ?, ?, ?, ?, 2.5, 1)`)
+        .bind(id, item.name.trim(), item.email, item.communication_email || null, await passwordHash(defaultPassword, salt), salt, teamId,
           today(), today(), round2(item.opening_balance)))
     }
     for (let index = 0; index < userStatements.length; index += 50) await c.env.DB.batch(userStatements.slice(index, index + 50))
@@ -872,8 +959,8 @@ app.post('/api/communications/weekly/:id/publish', async (c) => {
     published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
     .bind(publishedBody, publishedBody, actor.id, communication.id).run()
   const supervisorQuery = communication.team_id
-    ? c.env.DB.prepare(`SELECT email FROM users WHERE role = 'SUPERVISOR' AND active = 1 AND team_id = ?`).bind(communication.team_id)
-    : c.env.DB.prepare(`SELECT email FROM users WHERE role = 'SUPERVISOR' AND active = 1`)
+    ? c.env.DB.prepare(`SELECT COALESCE(NULLIF(communication_email, ''), email) email FROM users WHERE role = 'SUPERVISOR' AND active = 1 AND team_id = ?`).bind(communication.team_id)
+    : c.env.DB.prepare(`SELECT COALESCE(NULLIF(communication_email, ''), email) email FROM users WHERE role = 'SUPERVISOR' AND active = 1`)
   const supervisors = await supervisorQuery.all<{ email: string }>()
   const results = await Promise.all(supervisors.results.map((supervisor) => sendEmail(c.env.DB, c.env, {
     recipient: supervisor.email, subject: '[PSE] COMUNICADO SEMANAL DE AUSÊNCIAS', body: publishedBody, communicationId: communication.id,
