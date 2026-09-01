@@ -10,6 +10,7 @@ Aplicação para controle e projeção de férias e demais ausências, com auten
 - Toda solicitação nasce pendente; somente supervisores aprovam e o solicitante pode cancelar até a aprovação final no Quantum.
 - Inclusão de solicitação pelo supervisor para integrantes da equipe.
 - Edição e inativação de colaboradores por administradores e supervisores.
+- Importação de colaboradores e solicitações futuras de férias por CSV, com prévia, tratamento de sobreposições e proteção contra duplicidade.
 - Regras individuais de acréscimo mensal e fator de desconto de férias.
 - Projeção mensal do saldo, incluindo férias solicitadas e confirmadas.
 - Feriados globais ou por equipe, integrais ou de meio período, no cálculo de dias úteis.
@@ -92,9 +93,26 @@ O Worker possui um Cron Trigger configurado para executar toda segunda-feira às
 
 A cópia e a publicação no Microsoft Teams continuam manuais.
 
+## Importação de colaboradores e férias
+
+Administradores e supervisores podem importar até 500 registros por arquivo. O supervisor importa exclusivamente para a própria equipe; o administrador escolhe a equipe de destino. O CSV deve conter:
+
+```text
+Id;Hora de início;Email;Nome;Data de Início;Data Final;Número de dias úteis;Saldo de férias atual no último PaySlip;Observações:
+```
+
+- `Id` e `Hora de início` são recomendados; as demais colunas, exceto `Observações`, são obrigatórias.
+- A coluna `Observações` é ignorada.
+- Períodos encerrados antes da data da importação não geram solicitações.
+- Em períodos sobrepostos da mesma pessoa, permanece o registro enviado mais recentemente.
+- Colaboradores já existentes são identificados pelo e-mail e não são duplicados nem têm o saldo sobrescrito.
+- Novos colaboradores recebem os valores individuais padrão e a senha inicial `1234567890`.
+- As solicitações são criadas no status `Solicitada` e não geram notificações durante a importação.
+- A repetição do mesmo arquivo não duplica solicitações já cadastradas.
+
 ## Segurança
 
-- Não existem senhas padrão no repositório.
+- A senha inicial usada na importação deve ser substituída pelo supervisor ou administrador após a carga.
 - Senhas são derivadas com PBKDF2-SHA-256 e salt individual (100 mil iterações).
 - Sessões usam tokens aleatórios, armazenados no banco apenas como SHA-256.
 - Cookies são `HttpOnly`, `Secure` e `SameSite=Lax`.

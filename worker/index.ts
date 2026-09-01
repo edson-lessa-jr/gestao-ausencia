@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { addDays, calendarDays, countBusinessDays, isoDate, vacationBalance, weekRange } from './domain'
+import { supersededOverlaps } from './import-rules'
 
 // Deployed through Cloudflare Workers Builds from the main branch.
 
@@ -12,10 +13,42 @@ type User = {
   monthly_accrual: number; vacation_debit_factor: number; active: number
 }
 
+type VacationImportRow = {
+  line: number
+  external_id?: string
+  submitted_at?: string
+  email: string
+  name: string
+  start_date: string
+  end_date: string
+  business_days: number
+  opening_balance: number
+}
+
+type VacationImportItem = VacationImportRow & {
+  action: 'CREATE' | 'EXISTING' | 'SKIP' | 'REVIEW' | 'ERROR'
+  message: string
+}
+
 const app = new Hono<{ Bindings: Bindings; Variables: { user: User } }>()
 const jsonError = (message: string, status = 400) => ({ message, status })
 const today = () => isoDate(new Date())
 const encoder = new TextEncoder()
+
+const round2 = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100
+const hasAtMostTwoDecimals = (value: number) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-7
+const isIsoDate = (value: string) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const parsed = new Date(`${value}T12:00:00Z`)
+  return !Number.isNaN(parsed.getTime()) && isoDate(parsed) === value
+}
+const cleanEmail = (value: string) => value.trim().replace('\\@', '@').toLowerCase()
+const displayNameFromEmail = (email: string) => email.split('@')[0].split(/[._-]+/).filter(Boolean)
+  .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()).join(' ')
+const submittedAtKey = (value?: string) => {
+  const match = value?.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})/)
+  return match ? `${match[3]}${match[2]}${match[1]}${match[4]}${match[5]}` : ''
+}
 
 function bytesToHex(bytes: Uint8Array) {
   return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -211,6 +244,109 @@ async function audit(db: D1Database, actorId: string | null, action: string, ent
     .bind(crypto.randomUUID(), actorId, action, entityType, entityId ?? null, payload ? JSON.stringify(payload) : null).run()
 }
 
+async function analyzeVacationImport(db: D1Database, actor: User, teamId: string, sourceRows: VacationImportRow[]) {
+  if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) throw new Error('Acesso restrito.')
+  if (actor.role === 'SUPERVISOR' && actor.team_id !== teamId) throw new Error('O supervisor somente pode importar para a própria equipe.')
+  const team = await db.prepare('SELECT id, name FROM teams WHERE id = ? AND active = 1').bind(teamId)
+    .first<{ id: string; name: string }>()
+  if (!team) throw new Error('Equipe não encontrada ou inativa.')
+  if (!Array.isArray(sourceRows) || sourceRows.length === 0 || sourceRows.length > 500) {
+    throw new Error('O CSV deve conter entre 1 e 500 registros.')
+  }
+
+  const rows: VacationImportItem[] = sourceRows.map((source, index) => {
+    const email = cleanEmail(String(source.email || ''))
+    const suppliedName = String(source.name || '').trim()
+    const name = !suppliedName || suppliedName.includes('@') ? displayNameFromEmail(email) : suppliedName
+    return {
+      line: Number(source.line || index + 2), external_id: String(source.external_id || '').trim() || undefined,
+      submitted_at: String(source.submitted_at || '').trim() || undefined, email, name,
+      start_date: String(source.start_date || '').trim(), end_date: String(source.end_date || '').trim(),
+      business_days: typeof source.business_days === 'number' ? source.business_days : Number.NaN,
+      opening_balance: typeof source.opening_balance === 'number' ? source.opening_balance : Number.NaN,
+      action: 'CREATE', message: 'Pronto para importar.',
+    }
+  })
+
+  const latestByEmail = new Map<string, VacationImportItem>()
+  for (const row of rows) {
+    const current = latestByEmail.get(row.email)
+    const rowKey = submittedAtKey(row.submitted_at) || String(row.line).padStart(8, '0')
+    const currentKey = current && (submittedAtKey(current.submitted_at) || String(current.line).padStart(8, '0'))
+    if (!current || rowKey >= currentKey!) latestByEmail.set(row.email, row)
+  }
+
+  const allUsers = await db.prepare('SELECT id, name, email, team_id FROM users').all<Pick<User, 'id' | 'name' | 'email' | 'team_id'>>()
+  const userByEmail = new Map(allUsers.results.map((user) => [user.email.toLowerCase(), user]))
+  const users = [...latestByEmail.values()].map((row): VacationImportItem => {
+    if (!row.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) return { ...row, action: 'ERROR', message: 'E-mail inválido.' }
+    if (!row.name) return { ...row, action: 'ERROR', message: 'Nome não identificado.' }
+    if (!Number.isFinite(row.opening_balance) || row.opening_balance < 0 || !hasAtMostTwoDecimals(row.opening_balance)) {
+      return { ...row, action: 'ERROR', message: 'O saldo deve ser positivo e possuir no máximo duas casas decimais.' }
+    }
+    const existing = userByEmail.get(row.email)
+    if (existing && existing.team_id !== teamId) return { ...row, action: 'ERROR', message: 'O e-mail já pertence a outra equipe.' }
+    if (existing) return { ...row, action: 'EXISTING', message: 'Colaborador já cadastrado; seus dados e saldo não serão alterados.' }
+    return { ...row, opening_balance: round2(row.opening_balance), action: 'CREATE', message: 'Novo colaborador.' }
+  })
+  const userResultByEmail = new Map(users.map((row) => [row.email, row]))
+
+  for (const row of rows) {
+    if (!isIsoDate(row.start_date) || !isIsoDate(row.end_date)) {
+      row.action = 'ERROR'; row.message = 'Data inicial ou final inválida.'; continue
+    }
+    if (row.end_date < today()) {
+      row.action = 'SKIP'; row.message = 'Período já encerrado.'; continue
+    }
+    if (row.end_date < row.start_date) {
+      row.action = 'ERROR'; row.message = 'A data final é anterior à data inicial.'; continue
+    }
+    if (!Number.isFinite(row.business_days) || row.business_days <= 0 || !hasAtMostTwoDecimals(row.business_days)) {
+      row.action = 'ERROR'; row.message = 'A quantidade de dias úteis deve ser positiva e possuir no máximo duas casas decimais.'; continue
+    }
+    if (row.business_days > calendarDays(row.start_date, row.end_date)) {
+      row.action = 'ERROR'; row.message = 'A quantidade de dias úteis é maior que o período informado.'; continue
+    }
+    const userResult = userResultByEmail.get(row.email)
+    if (!userResult || userResult.action === 'ERROR') {
+      row.action = 'ERROR'; row.message = userResult?.message || 'Colaborador inválido.'
+    }
+  }
+
+  const superseded = supersededOverlaps(rows.filter((item) => item.action === 'CREATE'))
+  for (const row of rows) {
+    const newerLine = superseded.get(row.line)
+    if (newerLine) { row.action = 'SKIP'; row.message = `Substituído pelo registro mais recente da linha ${newerLine}.` }
+  }
+
+  const existingRequests = await db.prepare(`SELECT r.id, r.user_id, r.start_date, r.end_date, u.email
+    FROM absence_requests r JOIN users u ON u.id = r.user_id
+    WHERE r.type = 'VACATION' AND r.status NOT IN ('REJECTED', 'CANCELLED') AND u.team_id = ?`)
+    .bind(teamId).all<{ id: string; user_id: string; start_date: string; end_date: string; email: string }>()
+  for (const row of rows.filter((item) => item.action === 'CREATE')) {
+    const matches = existingRequests.results.filter((item) => item.email.toLowerCase() === row.email
+      && row.start_date <= item.end_date && row.end_date >= item.start_date)
+    if (matches.some((item) => item.start_date === row.start_date && item.end_date === row.end_date)) {
+      row.action = 'SKIP'; row.message = 'Solicitação já cadastrada.'
+    } else if (matches.length) {
+      row.action = 'REVIEW'; row.message = 'O período sobrepõe uma solicitação já existente no sistema.'
+    }
+  }
+
+  return {
+    team,
+    users,
+    requests: rows,
+    summary: {
+      users_to_create: users.filter((item) => item.action === 'CREATE').length,
+      users_existing: users.filter((item) => item.action === 'EXISTING').length,
+      requests_to_create: rows.filter((item) => item.action === 'CREATE').length,
+      requests_skipped: rows.filter((item) => item.action === 'SKIP').length,
+      review_or_error: [...users, ...rows].filter((item) => ['REVIEW', 'ERROR'].includes(item.action)).length,
+    },
+  }
+}
+
 app.use('/api/*', async (c, next) => {
   c.header('Cache-Control', 'no-store')
   c.header('X-Content-Type-Options', 'nosniff')
@@ -314,12 +450,16 @@ app.post('/api/users', async (c) => {
   const role = actor.role === 'SUPERVISOR' ? 'EMPLOYEE' : body.role
   if (!body.name || !body.email || !body.password || !teamId || !role) return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
   if (body.password.length < 10) return c.json(jsonError('A senha temporária deve ter pelo menos 10 caracteres.'), 400)
+  const openingBalance = Number(body.opening_vacation_balance ?? 0)
+  if (!Number.isFinite(openingBalance) || openingBalance < 0 || !hasAtMostTwoDecimals(openingBalance)) {
+    return c.json(jsonError('O saldo inicial deve ser positivo e possuir no máximo duas casas decimais.'), 400)
+  }
   const id = crypto.randomUUID(); const salt = crypto.randomUUID()
   await c.env.DB.prepare(`INSERT INTO users
     (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date, opening_vacation_balance, monthly_accrual, vacation_debit_factor)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(id, body.name.trim(), body.email.trim().toLowerCase(), await passwordHash(body.password, salt), salt, role, teamId,
-      body.hire_date || today(), body.balance_start_date || today(), Number(body.opening_vacation_balance || 0), Number(body.monthly_accrual || 2.5), Number(body.vacation_debit_factor || 1)).run()
+      body.hire_date || today(), body.balance_start_date || today(), round2(openingBalance), Number(body.monthly_accrual || 2.5), Number(body.vacation_debit_factor || 1)).run()
   await audit(c.env.DB, actor.id, 'CREATE', 'USER', id, { ...body, password: undefined })
   return c.json({ id }, 201)
 })
@@ -339,6 +479,10 @@ app.patch('/api/users/:id', async (c) => {
   if (!body.name || !body.email || !teamId || !body.hire_date || !body.balance_start_date) {
     return c.json(jsonError('Preencha os campos obrigatórios.'), 400)
   }
+  const openingBalance = Number(body.opening_vacation_balance ?? 0)
+  if (!Number.isFinite(openingBalance) || openingBalance < 0 || !hasAtMostTwoDecimals(openingBalance)) {
+    return c.json(jsonError('O saldo inicial deve ser positivo e possuir no máximo duas casas decimais.'), 400)
+  }
   if (target.id === actor.id && !body.active) return c.json(jsonError('Você não pode inativar a própria conta.'), 409)
   if (target.role === 'ADMIN' && !body.active) {
     const admins = await c.env.DB.prepare(`SELECT COUNT(*) count FROM users WHERE role = 'ADMIN' AND active = 1 AND id <> ?`)
@@ -349,7 +493,7 @@ app.patch('/api/users/:id', async (c) => {
     hire_date = ?, balance_start_date = ?, opening_vacation_balance = ?, monthly_accrual = ?, vacation_debit_factor = ?,
     updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(
       body.name.trim(), body.email.trim().toLowerCase(), role, teamId, body.active ? 1 : 0,
-      body.hire_date, body.balance_start_date, Number(body.opening_vacation_balance ?? 0),
+      body.hire_date, body.balance_start_date, round2(openingBalance),
       Number(body.monthly_accrual ?? 2.5), Number(body.vacation_debit_factor ?? 1), target.id,
     )]
   if (body.password) {
@@ -362,6 +506,79 @@ app.patch('/api/users/:id', async (c) => {
   if (!body.active) await c.env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(target.id).run()
   await audit(c.env.DB, actor.id, 'UPDATE', 'USER', target.id, { ...body, password: body.password ? '[ALTERADA]' : undefined })
   return c.json({ ok: true })
+})
+
+app.post('/api/users/vacation-import/preview', async (c) => {
+  const actor = c.get('user')
+  if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
+  const body = await c.req.json<{ team_id?: string; rows: VacationImportRow[] }>()
+  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id
+  if (!teamId) return c.json(jsonError('Selecione a equipe que receberá a importação.'), 400)
+  try {
+    return c.json(await analyzeVacationImport(c.env.DB, actor, teamId, body.rows))
+  } catch (error) {
+    return c.json(jsonError(error instanceof Error ? error.message : 'Não foi possível analisar o CSV.'), 400)
+  }
+})
+
+app.post('/api/users/vacation-import', async (c) => {
+  const actor = c.get('user')
+  if (!['ADMIN', 'SUPERVISOR'].includes(actor.role)) return c.json(jsonError('Acesso restrito.', 403), 403)
+  const body = await c.req.json<{ team_id?: string; rows: VacationImportRow[] }>()
+  const teamId = actor.role === 'SUPERVISOR' ? actor.team_id : body.team_id
+  if (!teamId) return c.json(jsonError('Selecione a equipe que receberá a importação.'), 400)
+  try {
+    const preview = await analyzeVacationImport(c.env.DB, actor, teamId, body.rows)
+    const usersToCreate = preview.users.filter((item) => item.action === 'CREATE')
+    const defaultPassword = '1234567890'
+    const userStatements: D1PreparedStatement[] = []
+    for (const item of usersToCreate) {
+      const id = crypto.randomUUID(); const salt = crypto.randomUUID()
+      userStatements.push(c.env.DB.prepare(`INSERT INTO users
+        (id, name, email, password_hash, password_salt, role, team_id, hire_date, balance_start_date,
+          opening_vacation_balance, monthly_accrual, vacation_debit_factor)
+        VALUES (?, ?, ?, ?, ?, 'EMPLOYEE', ?, ?, ?, ?, 2.5, 1)`)
+        .bind(id, item.name.trim(), item.email, await passwordHash(defaultPassword, salt), salt, teamId,
+          today(), today(), round2(item.opening_balance)))
+    }
+    for (let index = 0; index < userStatements.length; index += 50) await c.env.DB.batch(userStatements.slice(index, index + 50))
+
+    const teamUsers = await c.env.DB.prepare(`SELECT id, email, vacation_debit_factor FROM users WHERE team_id = ?`)
+      .bind(teamId).all<{ id: string; email: string; vacation_debit_factor: number }>()
+    const userByEmail = new Map(teamUsers.results.map((user) => [user.email.toLowerCase(), user]))
+    const requestsToCreate = preview.requests.filter((item) => item.action === 'CREATE')
+    const requestStatements: D1PreparedStatement[] = []
+    for (const item of requestsToCreate) {
+      const target = userByEmail.get(item.email)
+      if (!target) continue
+      const requestId = crypto.randomUUID()
+      const days = round2(item.business_days)
+      requestStatements.push(c.env.DB.prepare(`INSERT INTO absence_requests
+        (id, user_id, created_by, type, start_date, end_date, business_days, calendar_days,
+          debit_days, administrative_days, status, reason)
+        VALUES (?, ?, ?, 'VACATION', ?, ?, ?, ?, ?, 0, 'REQUESTED', NULL)`)
+        .bind(requestId, target.id, actor.id, item.start_date, item.end_date, days,
+          calendarDays(item.start_date, item.end_date), round2(days * Number(target.vacation_debit_factor))))
+      requestStatements.push(c.env.DB.prepare(`INSERT INTO request_status_history
+        (id, request_id, actor_id, previous_status, new_status, note)
+        VALUES (?, ?, ?, NULL, 'REQUESTED', 'Solicitação importada de CSV.')`)
+        .bind(crypto.randomUUID(), requestId, actor.id))
+    }
+    for (let index = 0; index < requestStatements.length; index += 50) await c.env.DB.batch(requestStatements.slice(index, index + 50))
+    await audit(c.env.DB, actor.id, 'IMPORT', 'VACATION_CSV', undefined, {
+      team_id: teamId, users_created: usersToCreate.length, requests_created: requestsToCreate.length,
+      skipped: preview.summary.requests_skipped, review_or_error: preview.summary.review_or_error,
+    })
+    return c.json({
+      users_created: usersToCreate.length,
+      users_existing: preview.summary.users_existing,
+      requests_created: requestsToCreate.length,
+      requests_skipped: preview.summary.requests_skipped,
+      review_or_error: preview.summary.review_or_error,
+    }, 201)
+  } catch (error) {
+    return c.json(jsonError(error instanceof Error ? error.message : 'Não foi possível importar o CSV.'), 400)
+  }
 })
 
 app.get('/api/holidays', async (c) => {
