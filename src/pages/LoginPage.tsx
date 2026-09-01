@@ -3,7 +3,7 @@ import { Alert, Box, Button, Paper, Stack, TextField, Typography } from '@mui/ma
 import { post } from '../api'
 
 export default function LoginPage({ needsSetup, onAuthenticated }: { needsSetup: boolean; onAuthenticated: () => Promise<void> }) {
-  const [form, setForm] = useState({ name: '', teamName: 'Equipe principal', email: '', password: '' })
+  const [form, setForm] = useState({ name: '', teamName: 'Equipe principal', email: '', communication_email: '', password: '' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const set = (field: keyof typeof form) => (event: React.ChangeEvent<HTMLInputElement>) => setForm({ ...form, [field]: event.target.value })
@@ -34,7 +34,8 @@ export default function LoginPage({ needsSetup, onAuthenticated }: { needsSetup:
           {error && <Alert severity="error">{error}</Alert>}
           {needsSetup && <><TextField label="Nome do administrador" required value={form.name} onChange={set('name')} />
             <TextField label="Nome da primeira equipe" required value={form.teamName} onChange={set('teamName')} /></>}
-          <TextField label="E-mail" type="email" autoComplete="email" required value={form.email} onChange={set('email')} />
+          <TextField label={needsSetup ? 'E-mail de registro e acesso' : 'E-mail'} type="email" autoComplete="email" required value={form.email} onChange={set('email')} />
+          {needsSetup && <TextField label="E-mail de comunicação (opcional)" type="email" value={form.communication_email} onChange={set('communication_email')} />}
           <TextField label="Senha" type="password" autoComplete={needsSetup ? 'new-password' : 'current-password'} required helperText={needsSetup ? 'Mínimo de 10 caracteres.' : undefined} value={form.password} onChange={set('password')} />
           <Button type="submit" variant="contained" size="large" disabled={busy}>{busy ? 'Aguarde…' : needsSetup ? 'Criar ambiente' : 'Entrar'}</Button>
         </Stack>
