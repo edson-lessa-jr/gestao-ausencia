@@ -6,6 +6,7 @@ export interface User {
   id: string
   name: string
   email: string
+  communication_email: string | null
   role: Role
   team_id: string | null
   team_name?: string | null

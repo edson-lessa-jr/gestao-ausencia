@@ -3,6 +3,7 @@ export interface VacationCsvRow {
   external_id?: string
   submitted_at?: string
   email: string
+  communication_email?: string
   name: string
   start_date: string
   end_date: string
@@ -50,7 +51,9 @@ export function parseVacationCsv(content: string): VacationCsvRow[] {
   const find = (...names: string[]) => headers.findIndex((header) => names.includes(header))
   const indexes = {
     id: find('id'), submitted: find('hora de inicio', 'data de envio', 'enviado em'),
-    email: find('email', 'e-mail'), name: find('nome'), start: find('data de inicio', 'inicio'),
+    email: find('email', 'e-mail', 'email de registro', 'e-mail de registro', 'email undp', 'e-mail undp'),
+    communication: find('email de comunicacao', 'e-mail de comunicacao', 'email cnj', 'e-mail cnj'),
+    name: find('nome'), start: find('data de inicio', 'inicio'),
     end: find('data final', 'data de termino', 'fim'), days: find('numero de dias uteis', 'dias uteis'),
     balance: find('saldo de ferias atual no ultimo payslip', 'saldo de ferias', 'saldo atual'),
   }
@@ -64,6 +67,9 @@ export function parseVacationCsv(content: string): VacationCsvRow[] {
       external_id: indexes.id >= 0 ? columns[indexes.id]?.trim() : undefined,
       submitted_at: indexes.submitted >= 0 ? columns[indexes.submitted]?.trim() : undefined,
       email: columns[indexes.email]?.trim().replace('\\@', '@') || '',
+      ...(indexes.communication >= 0 && columns[indexes.communication]?.trim()
+        ? { communication_email: columns[indexes.communication].trim().replace('\\@', '@') }
+        : {}),
       name: columns[indexes.name]?.trim() || '',
       start_date: toIsoDate(columns[indexes.start] || ''),
       end_date: toIsoDate(columns[indexes.end] || ''),
