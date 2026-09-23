@@ -79,7 +79,7 @@ O Worker envia as notificações para um fluxo do Power Automate, que usa a cone
 npx wrangler secret put POWER_AUTOMATE_WEBHOOK_URL
 ```
 
-O fluxo deve aceitar o JSON `{ "to": "...", "subject": "...", "html": "..." }` e mapear esses campos na ação `Enviar um e-mail (V2)`. A URL contém a autorização do gatilho e não deve ser cadastrada como variável comum nem incluída no `wrangler.jsonc`. Sem esse segredo, a tentativa fica registrada como `SKIPPED` no banco para auditoria.
+O fluxo deve aceitar o JSON `{ "to": "...", "subject": "...", "html": "..." }`, mapear esses campos na ação `Enviar um e-mail (V2)` e finalizar com uma ação `Resposta` de status `200`. Sem a resposta final, o Power Automate devolve `202` antes de confirmar a conclusão e a notificação permanece como `PENDING`. A URL contém a autorização do gatilho e não deve ser cadastrada como variável comum nem incluída no `wrangler.jsonc`. Sem esse segredo, a tentativa fica registrada como `SKIPPED` no banco para auditoria.
 
 ## Comunicado semanal automático
 

@@ -123,11 +123,16 @@ async function sendEmail(
       body: JSON.stringify(powerAutomatePayload(input.recipient, input.subject, input.body)),
     })
     const responseBody = await response.text()
+    const providerId = response.headers.get('x-ms-workflow-run-id') || response.headers.get('x-ms-request-id')
+    if (response.status === 202) {
+      await db.prepare(`UPDATE email_notifications SET status = 'PENDING', attempts = 1, provider_id = ?, error = ? WHERE id = ?`)
+        .bind(providerId, 'Power Automate aceitou a solicitação, mas não confirmou a conclusão. Adicione uma ação Resposta com status 200 ao final do fluxo.', id).run()
+      return { id, status: 'PENDING' as const }
+    }
     if (!response.ok) {
       const details = responseBody.trim().slice(0, 500)
       throw new Error(`Power Automate retornou HTTP ${response.status}${details ? `: ${details}` : ''}`)
     }
-    const providerId = response.headers.get('x-ms-workflow-run-id') || response.headers.get('x-ms-request-id')
     await db.prepare(`UPDATE email_notifications SET status = 'SENT', attempts = 1, provider_id = ?, sent_at = CURRENT_TIMESTAMP WHERE id = ?`)
       .bind(providerId, id).run()
     return { id, status: 'SENT' as const }
