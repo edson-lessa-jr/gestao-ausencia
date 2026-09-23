@@ -2,10 +2,11 @@ import { Hono } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import { addDays, calendarDays, countBusinessDays, isoDate, vacationBalance, weekRange } from './domain'
 import { supersededOverlaps } from './import-rules'
+import { powerAutomatePayload } from './email'
 
 // Deployed through Cloudflare Workers Builds from the main branch.
 
-type Bindings = { DB: D1Database; ASSETS: Fetcher; RESEND_API_KEY?: string; EMAIL_FROM?: string }
+type Bindings = { DB: D1Database; ASSETS: Fetcher; POWER_AUTOMATE_WEBHOOK_URL?: string }
 type Role = 'ADMIN' | 'SUPERVISOR' | 'EMPLOYEE'
 type User = {
   id: string; name: string; email: string; communication_email: string | null; role: Role; team_id: string | null; team_name?: string | null
@@ -110,21 +111,25 @@ async function sendEmail(
   await db.prepare(`INSERT INTO email_notifications
     (id, request_id, communication_id, recipient, subject, body) VALUES (?, ?, ?, ?, ?, ?)`)
     .bind(id, input.requestId || null, input.communicationId || null, input.recipient, input.subject, input.body).run()
-  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) {
+  if (!env.POWER_AUTOMATE_WEBHOOK_URL) {
     await db.prepare(`UPDATE email_notifications SET status = 'SKIPPED', error = ? WHERE id = ?`)
-      .bind('RESEND_API_KEY ou EMAIL_FROM não configurado.', id).run()
+      .bind('POWER_AUTOMATE_WEBHOOK_URL não configurado.', id).run()
     return { id, status: 'SKIPPED' as const }
   }
   try {
-    const response = await fetch('https://api.resend.com/emails', {
+    const response = await fetch(env.POWER_AUTOMATE_WEBHOOK_URL, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: env.EMAIL_FROM, to: [input.recipient], subject: input.subject, text: input.body }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(powerAutomatePayload(input.recipient, input.subject, input.body)),
     })
-    const result = await response.json<{ id?: string; message?: string }>()
-    if (!response.ok) throw new Error(result.message || `Falha HTTP ${response.status}`)
+    const responseBody = await response.text()
+    if (!response.ok) {
+      const details = responseBody.trim().slice(0, 500)
+      throw new Error(`Power Automate retornou HTTP ${response.status}${details ? `: ${details}` : ''}`)
+    }
+    const providerId = response.headers.get('x-ms-workflow-run-id') || response.headers.get('x-ms-request-id')
     await db.prepare(`UPDATE email_notifications SET status = 'SENT', attempts = 1, provider_id = ?, sent_at = CURRENT_TIMESTAMP WHERE id = ?`)
-      .bind(result.id || null, id).run()
+      .bind(providerId, id).run()
     return { id, status: 'SENT' as const }
   } catch (error) {
     await db.prepare(`UPDATE email_notifications SET status = 'FAILED', attempts = 1, error = ? WHERE id = ?`)

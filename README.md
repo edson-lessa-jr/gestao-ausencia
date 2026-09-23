@@ -73,14 +73,13 @@ npm run db:migrate:remote
 
 ## Envio de e-mail
 
-O Worker usa a API do Resend. Configure os segredos no Cloudflare Worker:
+O Worker envia as notificações para um fluxo do Power Automate, que usa a conexão autenticada do Office 365 Outlook. Configure a URL HTTP gerada pelo gatilho `Quando uma solicitação HTTP for recebida` como segredo do Cloudflare Worker:
 
 ```bash
-npx wrangler secret put RESEND_API_KEY
-npx wrangler secret put EMAIL_FROM
+npx wrangler secret put POWER_AUTOMATE_WEBHOOK_URL
 ```
 
-`EMAIL_FROM` deve ser um remetente autorizado no Resend, por exemplo `Gestão de ausências <ausencias@seudominio.br>`. Sem essas configurações, a operação continua funcionando e a tentativa fica registrada como `SKIPPED` no banco para auditoria.
+O fluxo deve aceitar o JSON `{ "to": "...", "subject": "...", "html": "..." }` e mapear esses campos na ação `Enviar um e-mail (V2)`. A URL contém a autorização do gatilho e não deve ser cadastrada como variável comum nem incluída no `wrangler.jsonc`. Sem esse segredo, a tentativa fica registrada como `SKIPPED` no banco para auditoria.
 
 ## Comunicado semanal automático
 
